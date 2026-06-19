@@ -1,0 +1,25 @@
+{
+  "name": "plana",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun run --watch src/index.ts",
+    "inspect": "bun run src/inspect.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^25.9.3"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "chrono-node": "^2.9.1",
+    "discord.js": "^14.26.4",
+    "dotenv": "^17.4.2",
+    "openai": "^6.44.0",
+    "zod": "^4.4.3"
+  }
+}
