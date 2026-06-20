@@ -92,7 +92,7 @@ export async function runMemoryWriter(
       model: config.defaultModel,
       messages: msg,
       temperature: 0,
-      maxTokens: 4000,
+      maxTokens: 8000,
     });
 
     if (!result.content) {

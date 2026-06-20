@@ -47,6 +47,7 @@ export async function startDiscord(
 
     console.log(`Persona: ${deps.persona.meta.display_name}`);
     console.log(`Model: ${deps.appConfig.defaultModel}`);
+    console.log(`Vision: ${deps.appConfig.visionModel}`);
     console.log(`Timezone: ${defaultTimezone}`);
     console.log("Plana is ready.");
   });

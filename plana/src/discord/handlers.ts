@@ -23,6 +23,7 @@ export interface HandlerDeps {
     opencodeBaseUrl: string;
     opencodeApiKey: string;
     defaultModel: string;
+    visionModel: string;
     defaultTimezone: string;
   };
 }
@@ -66,8 +67,10 @@ export function createHandlers(deps: HandlerDeps) {
     await message.channel.sendTyping();
 
     try {
-      store.saveMessage(guildId, channelId, "user", message.content);
-      incrementCount(thresholdState);
+      const imageAttachments = message.attachments.filter(
+        (a) => a.contentType?.startsWith("image/") && a.url,
+      );
+      const hasImages = imageAttachments.size > 0;
 
       const memoryBlock = memoryStore.buildMemoryBlock();
 
@@ -80,6 +83,28 @@ export function createHandlers(deps: HandlerDeps) {
         memoryBlock || undefined,
       );
 
+      if (hasImages) {
+        const imageUrls = imageAttachments.map((a) => a.url);
+        const imageBlocks = imageUrls.map((url) => ({
+          type: "image_url" as const,
+          image_url: { url },
+        }));
+        const textBlock = {
+          type: "text" as const,
+          text: message.content || "What do you see in this image?",
+        };
+        const lastIdx = currentMessages.length - 1;
+        currentMessages[lastIdx] = {
+          role: "user",
+          content: [...imageBlocks, textBlock],
+        } as ChatCompletionMessageParam;
+      }
+
+      const activeModel = hasImages ? appConfig.visionModel : appConfig.defaultModel;
+
+      store.saveMessage(guildId, channelId, "user", message.content);
+      incrementCount(thresholdState);
+
       const allToolNames: string[] = [];
       const allResultLines: string[] = [];
       let statusMsg: Message | null = null;
@@ -89,13 +114,13 @@ export function createHandlers(deps: HandlerDeps) {
       for (let round = 0; round < MAX_ROUNDS; round++) {
         const isFirstRound = round === 0;
         if (isFirstRound) {
-          log.llmRequest(appConfig.defaultModel, currentMessages, toolRegistry.definitions.length);
+          log.llmRequest(activeModel, currentMessages, toolRegistry.definitions.length);
         } else {
-          log.llmRequestFollowUp(appConfig.defaultModel, currentMessages);
+          log.llmRequestFollowUp(activeModel, currentMessages);
         }
 
         const result = await llm.chat({
-          model: appConfig.defaultModel,
+          model: activeModel,
           messages: currentMessages,
           tools: toolRegistry.definitions,
           maxToolIterations: 3,
@@ -207,10 +232,10 @@ export function createHandlers(deps: HandlerDeps) {
       }
 
       if (!responseSent) {
-        log.llmRequestFollowUp(appConfig.defaultModel, currentMessages);
+        log.llmRequestFollowUp(activeModel, currentMessages);
 
         const finalResult = await llm.chat({
-          model: appConfig.defaultModel,
+          model: activeModel,
           messages: currentMessages,
         });
 

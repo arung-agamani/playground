@@ -7,6 +7,7 @@ export interface AppConfig {
   opencodeApiKey: string;
   opencodeBaseUrl: string;
   defaultModel: string;
+  visionModel: string;
   guildId: string;
   defaultTimezone: string;
   tavilyApiKey?: string;
@@ -17,6 +18,7 @@ export function loadConfig(): AppConfig {
   const apiKey = process.env.OPENCODE_API_KEY;
   const baseUrl = process.env.OPENCODE_BASE_URL ?? "https://opencode.ai/zen/go/v1";
   const model = process.env.DEFAULT_MODEL ?? "deepseek-v4-flash";
+  const visionModel = process.env.VISION_MODEL ?? "mimo-v2.5";
   const guildId = process.env.GUILD_ID ?? "";
   const timezone = process.env.DEFAULT_TIMEZONE ?? "Asia/Jakarta";
 
@@ -32,6 +34,7 @@ export function loadConfig(): AppConfig {
     opencodeApiKey: apiKey,
     opencodeBaseUrl: baseUrl,
     defaultModel: model,
+    visionModel,
     guildId,
     defaultTimezone: timezone,
     tavilyApiKey: process.env.TAVILY_API_KEY || undefined,

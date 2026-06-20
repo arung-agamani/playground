@@ -57,6 +57,7 @@ const client = await startDiscord(
       opencodeBaseUrl: appConfig.opencodeBaseUrl,
       opencodeApiKey: appConfig.opencodeApiKey,
       defaultModel: appConfig.defaultModel,
+      visionModel: appConfig.visionModel,
       defaultTimezone: appConfig.defaultTimezone,
     },
   },
