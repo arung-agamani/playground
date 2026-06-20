@@ -10,6 +10,8 @@ export interface AppConfig {
   visionModel: string;
   guildId: string;
   defaultTimezone: string;
+  greetingTime: string;
+  greetingChannelId: string;
   tavilyApiKey?: string;
 }
 
@@ -37,6 +39,8 @@ export function loadConfig(): AppConfig {
     visionModel,
     guildId,
     defaultTimezone: timezone,
+    greetingTime: process.env.GREETING_TIME ?? "",
+    greetingChannelId: process.env.GREETING_CHANNEL_ID ?? "",
     tavilyApiKey: process.env.TAVILY_API_KEY || undefined,
   };
 }

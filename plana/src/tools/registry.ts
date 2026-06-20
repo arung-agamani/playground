@@ -2,6 +2,16 @@ import type { ChatCompletionTool } from "openai/resources/chat/completions";
 import type { ReminderStore } from "../reminders/store";
 import type { TaskStore } from "../tasks/store";
 import type { MemoryStore } from "../memory/store";
+import type { LoreStore } from "../lore/store";
+
+export const PROACTIVE_ALLOWED_TOOLS = new Set([
+  "get_current_time",
+  "list_tasks",
+  "daily_tasks",
+  "list_reminders",
+  "recall_knowledge",
+  "web_search",
+]);
 import {
   createReminderTools,
   createWebSearchTool,
@@ -29,6 +39,7 @@ export function createToolRegistry(
   reminderStore: ReminderStore,
   taskStore: TaskStore,
   memoryStore: MemoryStore,
+  loreStore: LoreStore,
   tavilyApiKey?: string,
   opencodeConfig?: { baseUrl: string; apiKey: string },
 ): ToolRegistry {
@@ -36,6 +47,7 @@ export function createToolRegistry(
   const taskTools = createTaskTools(taskStore);
   const memoryTools = createMemoryTools(
     memoryStore,
+    loreStore,
     opencodeConfig?.baseUrl ?? "",
     opencodeConfig?.apiKey ?? "",
   );
@@ -278,15 +290,15 @@ export function createToolRegistry(
     {
       type: "function",
       function: {
-        name: "recall_memory",
+        name: "recall_knowledge",
         description:
-          "Search Plana's memories and facts about Sensei. Use when Sensei asks about past conversations, references something from before, or you need context about who Sensei is.",
+          "Search ALL stored knowledge — personal memories about Sensei, known facts, and Blue Archive lore about Kivotos. Use this whenever Sensei asks about past conversations, references something you should know, mentions a Kivotos character or academy, or you need context about who Sensei is and their world.",
         parameters: {
           type: "object",
           properties: {
             query: {
               type: "string",
-              description: "What to search for in memories.",
+              description: "What to search for across all knowledge stores.",
             },
           },
           required: ["query"],
@@ -374,8 +386,8 @@ export function createToolRegistry(
       case "daily_tasks":
         return taskTools.daily(ctx);
 
-      case "recall_memory":
-        return memoryTools.recall(ctx, args);
+      case "recall_knowledge":
+        return memoryTools.recallKnowledge(ctx, args);
       case "add_fact":
         return memoryTools.addFact(ctx, args);
 

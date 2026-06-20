@@ -2,7 +2,8 @@ import type { ReminderStore } from "../reminders/store";
 import type { TaskStore } from "../tasks/store";
 import type { TaskStatus } from "../tasks/store";
 import type { MemoryStore } from "../memory/store";
-import { searchMemories, rerankWithLlm } from "../memory/search";
+import type { LoreStore } from "../lore/store";
+import { searchAll, rerankWithLlm } from "../memory/search";
 import { parseWhen, parseRecurrence, formatDueAt } from "../reminders/parser";
 import type { ToolContext } from "./registry";
 
@@ -386,38 +387,63 @@ export function createTaskTools(store: TaskStore) {
 
 export function createMemoryTools(
   memStore: MemoryStore,
+  loreStore: LoreStore,
   opencodeBaseUrl: string,
   opencodeApiKey: string,
 ) {
-  async function recall(ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
+  async function recallKnowledge(ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
     const query = args.query as string;
     if (!query?.trim()) return "Error: query is required.";
 
-    const { memories, facts, needsRerank } = searchMemories(memStore, query.trim());
+    const { memories, facts, lore } = searchAll(
+      memStore,
+      loreStore,
+      query.trim(),
+    );
 
-    if (memories.length === 0 && facts.length === 0) {
-      return "No memories or facts found matching that query.";
+    const totalResults = memories.length + facts.length + lore.length;
+
+    if (totalResults === 0) {
+      console.error("  recall_knowledge: 0 results → returning empty");
+      return "Nothing found matching that query in memories, facts, or lore.";
     }
 
-    if (!needsRerank) {
-      const lines = memories.slice(0, 3).map((m) => `[${m.tier}] ${m.content}`);
-      if (facts.length > 0) {
-        lines.push("");
-        lines.push("Known facts about Sensei:");
-        facts.forEach((f) => lines.push(`- ${f}`));
+    console.error(
+      `  recall_knowledge: ${memories.length}m ${facts.length}f ${lore.length}l → ${totalResults} total`,
+    );
+
+    if (totalResults <= 5) {
+      const lines: string[] = [];
+      if (memories.length > 0) {
+        lines.push("Memories:");
+        memories.forEach((m) => lines.push(`  [${m.tier}] ${m.content}`));
       }
-      return lines.join("\n");
+      if (facts.length > 0) {
+        lines.push("Facts:");
+        facts.forEach((f) => lines.push(`  - ${f}`));
+      }
+      if (lore.length > 0) {
+        lines.push("Lore:");
+        lore.forEach((l) => lines.push(`  [${l.character_name}] ${l.title}: ${l.content}`));
+      }
+      const result = lines.join("\n");
+      console.error("  recall_knowledge: direct return (≤5) → length:", result.length);
+      console.error("  recall_knowledge: result preview:", result.slice(0, 300));
+      return result;
     }
 
+    console.error("  recall_knowledge: reranking via LLM...");
     const reranked = await rerankWithLlm(
       query.trim(),
       memories,
       facts,
+      lore,
       opencodeBaseUrl,
       opencodeApiKey,
     );
 
-    return reranked || "No relevant memories found.";
+    console.error("  recall_knowledge: reranked length:", reranked.length, "| preview:", reranked.slice(0, 200));
+    return reranked || "No relevant results found.";
   }
 
   function addFact(_ctx: ToolContext, args: Record<string, unknown>): string {
@@ -428,5 +454,5 @@ export function createMemoryTools(
     return `Fact recorded: "${fact.trim()}"`;
   }
 
-  return { recall, addFact };
+  return { recallKnowledge, addFact };
 }

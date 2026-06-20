@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 
-export type ActionType = "remind";
+export type ActionType = "remind" | "greeting" | "nudge";
 
 export type ReminderStatus = "active" | "completed" | "cancelled";
 
@@ -34,7 +34,7 @@ export function createReminderStore(dbPath: string) {
       user_id         TEXT NOT NULL,
       message         TEXT NOT NULL,
       action_type     TEXT NOT NULL DEFAULT 'remind'
-                      CHECK(action_type IN ('remind')),
+                      CHECK(action_type IN ('remind', 'greeting', 'nudge')),
       action_config   TEXT NOT NULL DEFAULT '{}',
       type            TEXT NOT NULL CHECK(type IN ('once', 'recurring')),
       status          TEXT NOT NULL DEFAULT 'active'

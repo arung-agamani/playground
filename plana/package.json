@@ -6,7 +6,8 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun run --watch src/index.ts",
-    "inspect": "bun run src/inspect.ts"
+    "inspect": "bun run src/inspect.ts",
+    "lore:seed": "bun run src/lore/seed.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

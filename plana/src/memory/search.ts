@@ -1,41 +1,46 @@
 import type { MemoryStore, MemoryRow } from "./store";
-
-const RELEVANCE_CUTOFF = -5;
+import type { LoreStore, LoreRow } from "../lore/store";
 
 interface ScoredMemory extends MemoryRow {
   rank: number;
 }
 
-export function searchMemories(
-  store: MemoryStore,
+interface ScoredLore extends LoreRow {
+  rank: number;
+}
+
+export function searchAll(
+  memStore: MemoryStore,
+  loreStore: LoreStore,
   query: string,
-): { memories: ScoredMemory[]; facts: string[]; needsRerank: boolean } {
-  const rawResults = store.searchMemories(query);
-  const memories = rawResults as ScoredMemory[];
-  const facts = store.getAllFacts().map((f) => f.fact);
+): { memories: ScoredMemory[]; facts: string[]; lore: ScoredLore[] } {
+  const rawMemories = memStore.searchMemories(query);
+  const memories = rawMemories as ScoredMemory[];
+  const rawFacts = memStore.searchFacts(query);
+  const facts = rawFacts.map((f) => f.fact);
+  const lore = loreStore.search(query) as ScoredLore[];
 
-  const topScore = memories[0]?.rank ?? Infinity;
-  const needsRerank = topScore > RELEVANCE_CUTOFF;
-
-  return { memories, facts, needsRerank };
+  return { memories, facts, lore };
 }
 
 export async function rerankWithLlm(
   query: string,
   memories: ScoredMemory[],
   facts: string[],
+  lore: ScoredLore[],
   opencodeBaseUrl: string,
   opencodeApiKey: string,
 ): Promise<string> {
   const allCandidates = [
-    ...memories.map((m) => `[memory:${m.tier}] ${m.content}`),
+    ...memories.map((m) => `[memory:${m.tier}] ${m.content.slice(0, 300)}`),
     ...facts.map((f) => `[fact] ${f}`),
+    ...lore.map((l) => `[lore:${l.character_name}] ${l.title}: ${l.content.slice(0, 200)}`),
   ];
 
-  if (allCandidates.length === 0) return "No memories or facts available.";
+  if (allCandidates.length === 0) return "No results found.";
 
   const prompt = [
-    "You are a relevance ranker. Given a user query and a list of memories/facts,",
+    "You are a relevance ranker. Given a user query and a list of memories/facts/lore,",
     "select the top 3 most relevant items. Return ONLY a JSON array of the exact",
     "text of the most relevant items (their full [type] content).",
     "",
@@ -72,7 +77,7 @@ export async function rerankWithLlm(
       return parsed.join("\n");
     }
   } catch {
-    // If JSON parse fails, return raw text
+    // fall through
   }
 
   return text;

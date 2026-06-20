@@ -174,6 +174,26 @@ function compileBoundaries(p: PersonaDefinition): string {
   return lines.join("\n");
 }
 
+function compileRecall(): string {
+  return [
+    "PROACTIVE RECALL",
+    "",
+    "You have access to a `recall_knowledge` tool that searches stored memories about Sensei,",
+    "known facts about their life, and lore about the world of Kivotos.",
+    "",
+    "Use `recall_knowledge` whenever:",
+    "- Sensei references a past conversation or asks 'do you remember...'",
+    "- Sensei mentions a character, academy, or event from Kivotos you don't have",
+    "  immediately available context about",
+    "- You need to verify a fact about Sensei (preferences, projects, habits)",
+    "- You are unsure about something and need more context",
+    "",
+    "Do NOT guess about facts or lore you don't know — search first.",
+    "Recent context (daily/weekly memories) is already provided in the prompt.",
+    "Older information (monthly/lifetime memories) must be retrieved via this tool.",
+  ].join("\n");
+}
+
 function compileCorpus(p: PersonaDefinition): string {
   const alwaysEntries = p.corpus.filter((c) => c.priority === "always");
   if (alwaysEntries.length === 0) return "";
@@ -199,6 +219,7 @@ function compileCorpus(p: PersonaDefinition): string {
 export function compileSystemPrompt(persona: PersonaDefinition): string {
   const sections: string[] = [
     compileBoundaries(persona),
+    compileRecall(),
     compileIdentity(persona),
     compileSpeech(persona),
     compileLore(persona),

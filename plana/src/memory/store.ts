@@ -82,6 +82,16 @@ export function createMemoryStore(dbPath: string) {
     LIMIT 5
   `);
 
+  const searchFactsStmt = db.prepare(`
+    SELECT pinned_facts.id, pinned_facts.fact, pinned_facts.confidence,
+           bm25(facts_fts) as rank
+    FROM facts_fts
+    JOIN pinned_facts ON pinned_facts.id = facts_fts.rowid
+    WHERE facts_fts MATCH ?
+    ORDER BY rank
+    LIMIT 5
+  `);
+
   const getAllFactsStmt = db.prepare(
     `SELECT * FROM pinned_facts ORDER BY confidence DESC, created_at DESC`,
   );
@@ -108,14 +118,14 @@ export function createMemoryStore(dbPath: string) {
     const rows = getAllMemories();
     if (rows.length === 0) return "";
 
-    const tierOrder: MemoryTier[] = ["lifetime", "monthly", "weekly", "daily"];
-    const sorted = tierOrder
+    const include: MemoryTier[] = ["daily", "weekly"];
+    const blocks = include
       .map((t) => rows.find((r) => r.tier === t))
       .filter((r): r is MemoryRow => !!r && r.content.length > 0);
 
-    if (sorted.length === 0) return "";
+    if (blocks.length === 0) return "";
 
-    return sorted.map((r) => `[${r.tier}]: ${r.content}`).join("\n");
+    return blocks.map((r) => `[${r.tier}]: ${r.content}`).join("\n");
   }
 
   function insertFact(fact: string, source?: string, confidence = 0.5): void {
@@ -130,6 +140,11 @@ export function createMemoryStore(dbPath: string) {
   function searchMemories(query: string): Array<MemoryRow & { rank: number }> {
     const ftsQuery = query.split(/\s+/).map((w) => `"${w}"`).join(" OR ");
     return searchMemoriesStmt.all(ftsQuery) as Array<MemoryRow & { rank: number }>;
+  }
+
+  function searchFacts(query: string): Array<{ id: number; fact: string; confidence: number; rank: number }> {
+    const ftsQuery = query.split(/\s+/).map((w) => `"${w}"`).join(" OR ");
+    return searchFactsStmt.all(ftsQuery) as Array<{ id: number; fact: string; confidence: number; rank: number }>;
   }
 
   function cleanupFacts(minConfidence = 0.3): void {
@@ -149,6 +164,7 @@ export function createMemoryStore(dbPath: string) {
     insertFact,
     getAllFacts,
     searchMemories,
+    searchFacts,
     cleanupFacts,
     close,
   };
