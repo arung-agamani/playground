@@ -123,7 +123,8 @@ export function createConversationManager(store: ConversationStore) {
       });
     }
 
-    apiMessages.push(...ctx.messages, { role: "user", content: currentMessage });
+    const nowTs = formatTs(new Date().toISOString(), timezone);
+    apiMessages.push(...ctx.messages, { role: "user", content: `${nowTs} ${currentMessage}` });
     return apiMessages;
   }
 

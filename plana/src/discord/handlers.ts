@@ -217,7 +217,7 @@ export function createHandlers(deps: HandlerDeps) {
           log.responseSent(channelId, text);
 
           if (statusMsg) {
-            await message.channel.send(text);
+            await sendChunked(message, text);
           } else {
             await sendResponse(message, text);
           }
@@ -253,7 +253,7 @@ export function createHandlers(deps: HandlerDeps) {
           log.responseSent(channelId, text);
 
           if (statusMsg) {
-            await message.channel.send(text);
+            await sendChunked(message, text);
           } else {
             await sendResponse(message, text);
           }
@@ -361,6 +361,17 @@ async function sendResponse(message: Message, content: string): Promise<void> {
     } else {
       await message.channel.send(chunks[i]!);
     }
+  }
+}
+
+async function sendChunked(message: Message, content: string): Promise<void> {
+  if (content.length <= 2000) {
+    await message.channel.send(content);
+    return;
+  }
+  const chunks = splitMessage(content, 1990);
+  for (const chunk of chunks) {
+    await message.channel.send(chunk);
   }
 }
 
