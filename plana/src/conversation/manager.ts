@@ -8,8 +8,8 @@ export interface ConversationContext {
   historyTokens: number;
 }
 
-const MAX_CONTEXT_TOKENS = 24000;
-const MAX_HISTORY_MESSAGES = 30;
+const MAX_CONTEXT_TOKENS = 32000;
+const MAX_HISTORY_MESSAGES = 60;
 
 const MONTHS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -18,7 +18,10 @@ const MONTHS = [
 
 function formatTs(isoString: string, timezone: string): string {
   try {
-    const normalized = isoString.replace(" ", "T") + "Z";
+    let normalized = isoString;
+    if (!normalized.includes("T")) {
+      normalized = normalized.replace(" ", "T") + "Z";
+    }
     const d = new Date(normalized);
     if (Number.isNaN(d.getTime())) throw new Error("invalid");
 
