@@ -119,8 +119,8 @@ function seedGreetingReminder(
   }
 
   const now = new Date();
-  const due = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), h!, m!));
-  if (due <= now) due.setUTCDate(due.getUTCDate() + 1);
+  const due = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h!, m!, 0, 0);
+  if (due <= now) due.setDate(due.getDate() + 1);
 
   store.create({
     guildId: config.guildId,

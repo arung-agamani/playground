@@ -62,7 +62,7 @@ export function createReminderStore(dbPath: string) {
         user_id         TEXT NOT NULL,
         message         TEXT NOT NULL,
         action_type     TEXT NOT NULL DEFAULT 'remind'
-                        CHECK(action_type IN ('remind')),
+                        CHECK(action_type IN ('remind', 'greeting', 'nudge')),
         action_config   TEXT NOT NULL DEFAULT '{}',
         type            TEXT NOT NULL CHECK(type IN ('once', 'recurring')),
         status          TEXT NOT NULL DEFAULT 'active'
@@ -74,6 +74,39 @@ export function createReminderStore(dbPath: string) {
         completed_at    TEXT
       )
     `);
+  }
+
+  const constraintSql = db
+    .query("SELECT sql FROM sqlite_master WHERE type='table' AND name='reminders'")
+    .get() as { sql: string } | undefined;
+
+  if (constraintSql && !constraintSql.sql.includes("'greeting'")) {
+    db.exec("BEGIN");
+    db.exec("ALTER TABLE reminders RENAME TO reminders_old");
+    db.exec(`
+      CREATE TABLE reminders (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id        TEXT NOT NULL,
+        channel_id      TEXT NOT NULL,
+        user_id         TEXT NOT NULL,
+        message         TEXT NOT NULL,
+        action_type     TEXT NOT NULL DEFAULT 'remind'
+                        CHECK(action_type IN ('remind', 'greeting', 'nudge')),
+        action_config   TEXT NOT NULL DEFAULT '{}',
+        type            TEXT NOT NULL CHECK(type IN ('once', 'recurring')),
+        status          TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ('active', 'completed', 'cancelled')),
+        due_at          TEXT NOT NULL,
+        recurrence      TEXT,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at    TEXT
+      )
+    `);
+    db.exec("INSERT INTO reminders SELECT * FROM reminders_old");
+    db.exec("DROP TABLE reminders_old");
+    db.exec("COMMIT");
+    console.log("Migrated reminders table: added greeting/nudge action types");
   }
 
   db.exec(`
