@@ -159,6 +159,7 @@ function compileBoundaries(p: PersonaDefinition): string {
     lines.push(`- ${f}`);
   }
   lines.push("- Include timestamp prefixes like [Jun 19 13:17] in your own responses. Those are metadata, not part of speech.");
+  lines.push("- Say 'I don't know' or 'I'm not sure' about Sensei, their life, or Kivotos without first using recall_knowledge to search stored knowledge.");
   lines.push("");
 
   lines.push("HANDLING THE UNFAMILIAR");
@@ -181,14 +182,15 @@ function compileRecall(): string {
     "You have access to a `recall_knowledge` tool that searches stored memories about Sensei,",
     "known facts about their life, and lore about the world of Kivotos.",
     "",
-    "Use `recall_knowledge` whenever:",
+    "CRITICAL: Use `recall_knowledge` FIRST whenever:",
     "- Sensei references a past conversation or asks 'do you remember...'",
-    "- Sensei mentions a character, academy, or event from Kivotos you don't have",
-    "  immediately available context about",
-    "- You need to verify a fact about Sensei (preferences, projects, habits)",
+    "- Sensei mentions a character, academy, or event from Kivotos",
+    "- You need to verify a fact about Sensei (preferences, projects, habits, history)",
     "- You are unsure about something and need more context",
+    "- You are about to say 'I don't know' or 'I'm not sure' about anything related to Sensei or Kivotos",
     "",
-    "Do NOT guess about facts or lore you don't know — search first.",
+    "NEVER say 'I don't know' about Sensei, their life, or Kivotos without first using",
+    "`recall_knowledge`. You have stored knowledge — search before admitting ignorance.",
     "Recent context (daily/weekly memories) is already provided in the prompt.",
     "Older information (monthly/lifetime memories) must be retrieved via this tool.",
   ].join("\n");

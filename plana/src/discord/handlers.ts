@@ -66,6 +66,10 @@ export function createHandlers(deps: HandlerDeps) {
     log.messageReceived(message.author.tag, guildId, channelId, message.content);
     await message.channel.sendTyping();
 
+    const typingInterval = setInterval(() => {
+      message.channel.sendTyping().catch(() => {});
+    }, 8_000);
+
     try {
       const imageAttachments = message.attachments.filter(
         (a) => a.contentType?.startsWith("image/") && a.url,
@@ -132,26 +136,32 @@ export function createHandlers(deps: HandlerDeps) {
         if (toolCalls.length > 0) {
           log.llmResponse("tool_calls", null, toolCalls);
 
-          const hasText =
-            lastAsst?.content &&
-            typeof lastAsst.content === "string" &&
-            lastAsst.content.trim().length > 0;
+          const recallOnly = toolCalls.every(
+            (tc) => tc.function.name === "recall_knowledge",
+          );
 
-          if (hasText) {
-            await message.channel.send(stripTimestamp((lastAsst!.content as string).trim()));
-          }
+          if (!recallOnly) {
+            const hasText =
+              lastAsst?.content &&
+              typeof lastAsst.content === "string" &&
+              lastAsst.content.trim().length > 0;
 
-          const roundNames = toolCalls.map((tc) => tc.function.name);
-          allToolNames.push(...roundNames);
+            if (hasText) {
+              await message.channel.send(stripTimestamp((lastAsst!.content as string).trim()));
+            }
 
-          if (!statusMsg) {
-            statusMsg = await message.channel.send({
-              content: `🔧 *using ${roundNames.join(", ")}...*`,
-            });
-          } else {
-            await statusMsg.edit({
-              content: `🔧 *using ${allToolNames.join(", ")}...*`,
-            });
+            const roundNames = toolCalls.map((tc) => tc.function.name);
+            allToolNames.push(...roundNames);
+
+            if (!statusMsg) {
+              statusMsg = await message.channel.send({
+                content: `🔧 *using ${roundNames.join(", ")}...*`,
+              });
+            } else {
+              await statusMsg.edit({
+                content: `🔧 *using ${allToolNames.join(", ")}...*`,
+              });
+            }
           }
 
           const roundToolResults: ChatCompletionMessageParam[] = [];
@@ -266,6 +276,8 @@ export function createHandlers(deps: HandlerDeps) {
       await message.reply({
         content: "Ah... something seems to have gone wrong, Sensei. My apologies...",
       });
+    } finally {
+      clearInterval(typingInterval);
     }
   }
 

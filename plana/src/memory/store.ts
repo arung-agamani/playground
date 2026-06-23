@@ -14,7 +14,11 @@ export interface FactRow {
   fact: string;
   source: string | null;
   confidence: number;
+  nature: "persistent" | "temporal";
+  freshness: number;
+  revision: number;
   created_at: string;
+  updated_at: string;
 }
 
 export function createMemoryStore(dbPath: string) {
@@ -40,6 +44,47 @@ export function createMemoryStore(dbPath: string) {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
+
+  // ── Migration: add nature, freshness, revision, updated_at ────
+
+  const cols = db.query("PRAGMA table_info(pinned_facts)").all() as Array<{ name: string }>;
+  const hasFreshness = cols.some((c) => c.name === "freshness");
+
+  if (!hasFreshness) {
+    db.exec("BEGIN");
+    db.exec("ALTER TABLE pinned_facts RENAME TO pinned_facts_old");
+    db.exec(`
+      CREATE TABLE pinned_facts (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        fact       TEXT NOT NULL,
+        source     TEXT,
+        confidence REAL NOT NULL DEFAULT 0.5,
+        nature     TEXT NOT NULL DEFAULT 'temporal'
+                   CHECK(nature IN ('persistent', 'temporal')),
+        freshness  REAL NOT NULL DEFAULT 0.5,
+        revision   INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`
+      INSERT INTO pinned_facts (id, fact, source, confidence, nature, freshness, revision, created_at, updated_at)
+      SELECT id, fact, source, confidence, 'temporal', 0.5, 1, created_at, datetime('now')
+      FROM pinned_facts_old
+    `);
+    db.exec("DROP TABLE pinned_facts_old");
+    db.exec("DROP TABLE IF EXISTS facts_fts");
+    db.exec(`
+      CREATE VIRTUAL TABLE facts_fts USING fts5(
+        fact,
+        content=pinned_facts,
+        content_rowid=id
+      )
+    `);
+    db.exec("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')");
+    db.exec("COMMIT");
+    console.log("Migrated pinned_facts: added nature/freshness/revision, default temporal 0.5");
+  }
 
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -68,9 +113,33 @@ export function createMemoryStore(dbPath: string) {
 
   const getMemoryStmt = db.prepare(`SELECT * FROM memories WHERE tier = ?`);
   const getAllMemoriesStmt = db.prepare(`SELECT * FROM memories ORDER BY tier`);
-  const insertFactStmt = db.prepare(
-    `INSERT INTO pinned_facts (fact, source, confidence) VALUES (?, ?, ?)`,
-  );
+
+  const insertFactStmt = db.prepare(`
+    INSERT INTO pinned_facts (fact, source, confidence, nature, freshness)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  const searchFactDupStmt = db.prepare(`
+    SELECT pinned_facts.id, pinned_facts.fact, pinned_facts.confidence,
+           pinned_facts.nature, pinned_facts.freshness, pinned_facts.revision,
+           bm25(facts_fts) as rank
+    FROM facts_fts
+    JOIN pinned_facts ON pinned_facts.id = facts_fts.rowid
+    WHERE facts_fts MATCH ?
+    ORDER BY rank
+    LIMIT 1
+  `);
+
+  const updateFactStmt = db.prepare(`
+    UPDATE pinned_facts
+    SET fact = ?,
+        confidence = ?,
+        nature = ?,
+        freshness = 1.0,
+        revision = revision + 1,
+        updated_at = datetime('now')
+    WHERE id = ?
+  `);
 
   const searchMemoriesStmt = db.prepare(`
     SELECT memories.id, memories.tier, memories.content,
@@ -93,12 +162,19 @@ export function createMemoryStore(dbPath: string) {
   `);
 
   const getAllFactsStmt = db.prepare(
-    `SELECT * FROM pinned_facts ORDER BY confidence DESC, created_at DESC`,
+    `SELECT * FROM pinned_facts ORDER BY freshness DESC, confidence DESC, created_at DESC`,
   );
 
-  const deleteLowConfidenceStmt = db.prepare(
-    `DELETE FROM pinned_facts WHERE confidence < ?`,
-  );
+  const decayFactsStmt = db.prepare(`
+    UPDATE pinned_facts
+    SET freshness = MAX(0, freshness - 0.1),
+        updated_at = datetime('now')
+    WHERE nature = 'temporal' AND freshness > 0
+  `);
+
+  const cleanupFactsStmt = db.prepare(`
+    DELETE FROM pinned_facts WHERE nature = 'temporal' AND freshness <= 0
+  `);
 
   function upsertMemory(tier: MemoryTier, content: string): void {
     upsertMemoryStmt.run(tier, content);
@@ -128,9 +204,44 @@ export function createMemoryStore(dbPath: string) {
     return blocks.map((r) => `[${r.tier}]: ${r.content}`).join("\n");
   }
 
-  function insertFact(fact: string, source?: string, confidence = 0.5): void {
-    insertFactStmt.run(fact, source ?? null, confidence);
+  function insertFact(
+    fact: string,
+    options?: {
+      source?: string;
+      confidence?: number;
+      nature?: "persistent" | "temporal";
+    },
+  ): { id: number; merged: boolean } {
+    const nature = options?.nature ?? "temporal";
+    const confidence = options?.confidence ?? 0.8;
+
+    const ftsQuery = fact.split(/\s+/).map((w) => `"${w}"`).join(" OR ");
+    const existing = searchFactDupStmt.get(ftsQuery) as {
+      id: number;
+      rank: number;
+      fact: string;
+      confidence: number;
+      nature: string;
+      freshness: number;
+      revision: number;
+    } | undefined;
+
+    if (existing && existing.rank < -4) {
+      const newConfidence = Math.max(existing.confidence, confidence);
+      updateFactStmt.run(fact, newConfidence, nature, existing.id);
+      db.exec("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')");
+      return { id: existing.id, merged: true };
+    }
+
+    const result = insertFactStmt.run(
+      fact,
+      options?.source ?? null,
+      confidence,
+      nature,
+      1.0,
+    );
     db.exec("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')");
+    return { id: Number(result.lastInsertRowid), merged: false };
   }
 
   function getAllFacts(): FactRow[] {
@@ -147,9 +258,13 @@ export function createMemoryStore(dbPath: string) {
     return searchFactsStmt.all(ftsQuery) as Array<{ id: number; fact: string; confidence: number; rank: number }>;
   }
 
-  function cleanupFacts(minConfidence = 0.3): void {
-    deleteLowConfidenceStmt.run(minConfidence);
-    db.exec("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')");
+  function decayAndCleanup(): { decayed: number; cleaned: number } {
+    const decayResult = decayFactsStmt.run();
+    const cleanResult = cleanupFactsStmt.run();
+    if (decayResult.changes > 0 || cleanResult.changes > 0) {
+      db.exec("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')");
+    }
+    return { decayed: decayResult.changes, cleaned: cleanResult.changes };
   }
 
   function close(): void {
@@ -165,7 +280,7 @@ export function createMemoryStore(dbPath: string) {
     getAllFacts,
     searchMemories,
     searchFacts,
-    cleanupFacts,
+    decayAndCleanup,
     close,
   };
 }

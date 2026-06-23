@@ -450,7 +450,11 @@ export function createMemoryTools(
     const fact = args.fact as string;
     if (!fact?.trim()) return "Error: fact is required.";
 
-    memStore.insertFact(fact.trim(), "explicit", 0.9);
+    memStore.insertFact(fact.trim(), {
+      source: "explicit",
+      confidence: 0.9,
+      nature: "persistent",
+    });
     return `Fact recorded: "${fact.trim()}"`;
   }
 

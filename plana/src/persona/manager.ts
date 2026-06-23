@@ -15,6 +15,7 @@ export function loadPersona(dirPath: string): PersonaDefinition {
   }
 
   currentPersona = loadPersonaDir(normalized);
+  console.log(`Loaded persona: ${JSON.stringify(currentPersona,null,2)}`);
   return currentPersona;
 }
 

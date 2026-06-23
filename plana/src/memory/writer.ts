@@ -61,6 +61,10 @@ export async function runMemoryWriter(
     "piece of information (preference, trait, situation). Give each fact a confidence",
     "score (0-1). Only include facts with confidence > 0.5.",
     "",
+    "For each fact, classify its nature:",
+    "- 'persistent': unchanging truth about Sensei (identity, preferences, personality traits, history)",
+    "- 'temporal': current state that may change (schedules, deadlines, mood, work-in-progress, recent events)",
+    "",
     "EXISTING MEMORIES:",
     oldSummariesText,
     "",
@@ -76,7 +80,7 @@ export async function runMemoryWriter(
     '    "daily": "string"',
     "  },",
     '  "facts": [',
-    '    { "fact": "string", "confidence": 0.8 }',
+    '    { "fact": "string", "confidence": 0.8, "nature": "persistent" }',
     "  ]",
     "}",
   ].join("\n");
@@ -92,7 +96,7 @@ export async function runMemoryWriter(
       model: config.defaultModel,
       messages: msg,
       temperature: 0,
-      maxTokens: 8000,
+      maxTokens: 15000,
     });
 
     if (!result.content) {
@@ -111,7 +115,7 @@ export async function runMemoryWriter(
 
     let parsed: {
       summaries?: Record<string, string>;
-      facts?: Array<{ fact: string; confidence: number }>;
+      facts?: Array<{ fact: string; confidence: number; nature?: string }>;
     };
 
     try {
@@ -126,6 +130,11 @@ export async function runMemoryWriter(
     }
 
     if (parsed.summaries) {
+      const { decayed, cleaned } = memStore.decayAndCleanup();
+      if (decayed > 0 || cleaned > 0) {
+        log.info(`Memory writer: decayed ${decayed} facts, cleaned ${cleaned} stale`);
+      }
+
       for (const [tier, content] of Object.entries(parsed.summaries)) {
         if (typeof content === "string" && content.trim()) {
           memStore.upsertMemory(tier as "lifetime" | "monthly" | "weekly" | "daily", content.trim());
@@ -138,20 +147,26 @@ export async function runMemoryWriter(
 
     if (parsed.facts && Array.isArray(parsed.facts)) {
       let added = 0;
+      let merged = 0;
       for (const f of parsed.facts) {
         if (typeof f.fact === "string" && f.fact.trim() && f.confidence > 0.5) {
-          memStore.insertFact(f.fact.trim(), "memory_writer", f.confidence);
-          added++;
+          const nature = f.nature === "persistent" ? "persistent" : "temporal";
+          const result = memStore.insertFact(f.fact.trim(), {
+            source: "memory_writer",
+            confidence: f.confidence,
+            nature,
+          });
+          if (result.merged) merged++;
+          else added++;
         }
       }
-      if (added > 0) {
+      if (added > 0 || merged > 0) {
         const previews = parsed.facts!
           .filter((f) => typeof f.fact === "string" && f.fact.trim() && f.confidence > 0.5)
-          .map((f) => `"${f.fact}" (${f.confidence})`)
+          .map((f) => `"${f.fact}" (${f.confidence} ${f.nature ?? "temporal"})`)
           .join(", ");
-        log.info(`Memory writer: extracted ${added} fact(s): ${previews}`);
+        log.info(`Memory writer: extracted ${added} new + ${merged} merged fact(s): ${previews}`);
       }
-      memStore.cleanupFacts(0.3);
     }
   } catch (error) {
     log.error("Memory writer: error", error);
