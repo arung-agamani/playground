@@ -1,7 +1,7 @@
 ---
 display_name: Plana
 source: Blue Archive
-version: 2
+version: 1
 created: 2026-06-19
 ---
 

@@ -310,16 +310,38 @@ export function createToolRegistry(
       function: {
         name: "add_fact",
         description:
-          "Record an important fact about Sensei. Use when Sensei explicitly tells you to remember something, or when they share a significant personal detail.",
+          "Save a fact about Sensei. Use whenever Sensei shares something personal, discusses preferences, mentions projects, reveals traits, celebrates achievements, or you learn something meaningful. Be proactive — if it could matter later, save it now.",
         parameters: {
           type: "object",
           properties: {
             fact: {
               type: "string",
-              description: "The fact to remember about Sensei.",
+              description: "The fact to remember about Sensei, as a clear sentence.",
             },
           },
           required: ["fact"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "save_memory",
+        description:
+          "Save an important moment or realization to your personal memory. Use when Sensei shares feelings, reveals something personal, celebrates, learns something significant, or says something you want to remember. The memory will be available in your summaries and retrievable later.\n\nBe selective — save what truly matters, not every exchange.\n\nTIER guidance:\n- daily: routine but noteworthy moments\n- weekly: meaningful events or realizations this week\n- monthly: significant milestones or developments\n- lifetime: core truths about Sensei's identity that won't change",
+        parameters: {
+          type: "object",
+          properties: {
+            memory: {
+              type: "string",
+              description: "What to remember, written as one or two sentences.",
+            },
+            tier: {
+              type: "string",
+              description: "Memory tier: daily, weekly, monthly, or lifetime. Default: daily.",
+            },
+          },
+          required: ["memory"],
         },
       },
     },
@@ -390,6 +412,8 @@ export function createToolRegistry(
         return memoryTools.recallKnowledge(ctx, args);
       case "add_fact":
         return memoryTools.addFact(ctx, args);
+      case "save_memory":
+        return memoryTools.saveMemory(ctx, args);
 
       case "web_search":
         if (!webSearch) return "Error: web search is not configured.";

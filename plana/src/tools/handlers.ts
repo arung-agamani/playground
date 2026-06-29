@@ -2,6 +2,7 @@ import type { ReminderStore } from "../reminders/store";
 import type { TaskStore } from "../tasks/store";
 import type { TaskStatus } from "../tasks/store";
 import type { MemoryStore } from "../memory/store";
+import type { MemoryTier } from "../memory/store";
 import type { LoreStore } from "../lore/store";
 import { searchAll, rerankWithLlm } from "../memory/search";
 import { parseWhen, parseRecurrence, formatDueAt } from "../reminders/parser";
@@ -458,5 +459,24 @@ export function createMemoryTools(
     return `Fact recorded: "${fact.trim()}"`;
   }
 
-  return { recallKnowledge, addFact };
+  function saveMemory(_ctx: ToolContext, args: Record<string, unknown>): string {
+    const memory = (args.memory as string)?.trim();
+    if (!memory) return "Error: memory is required.";
+
+    const tier = (args.tier as string)?.trim() || "daily";
+    const validTiers: MemoryTier[] = ["daily", "weekly", "monthly", "lifetime"];
+    const resolvedTier = validTiers.includes(tier as MemoryTier)
+      ? (tier as MemoryTier)
+      : "daily";
+
+    const existing = memStore.getMemory(resolvedTier);
+    const newContent = existing
+      ? `${existing}\n${memory}`
+      : memory;
+
+    memStore.upsertMemory(resolvedTier, newContent);
+    return `Saved to [${resolvedTier}] memory: "${memory}"`;
+  }
+
+  return { recallKnowledge, addFact, saveMemory };
 }
