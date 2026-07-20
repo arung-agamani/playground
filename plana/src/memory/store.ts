@@ -176,6 +176,16 @@ export function createMemoryStore(dbPath: string) {
     DELETE FROM pinned_facts WHERE nature = 'temporal' AND freshness <= 0
   `);
 
+  const recentFactsStmt = db.prepare(`
+    SELECT fact FROM pinned_facts
+    WHERE nature = 'persistent' OR (nature = 'temporal' AND freshness > 0.6)
+    ORDER BY
+      CASE WHEN nature = 'persistent' THEN 0 ELSE 1 END,
+      freshness DESC,
+      created_at DESC
+    LIMIT 100
+  `);
+
   function upsertMemory(tier: MemoryTier, content: string): void {
     upsertMemoryStmt.run(tier, content);
     db.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')");
@@ -192,16 +202,26 @@ export function createMemoryStore(dbPath: string) {
 
   function buildMemoryBlock(): string {
     const rows = getAllMemories();
-    if (rows.length === 0) return "";
+    const recentFacts = recentFactsStmt.all() as Array<{ fact: string }>;
+    const parts: string[] = [];
 
     const include: MemoryTier[] = ["daily", "weekly"];
-    const blocks = include
-      .map((t) => rows.find((r) => r.tier === t))
-      .filter((r): r is MemoryRow => !!r && r.content.length > 0);
+    for (const tier of include) {
+      const r = rows.find((r) => r.tier === tier);
+      if (r && r.content.length > 0) {
+        parts.push(`[${tier}]: ${r.content}`);
+      }
+    }
 
-    if (blocks.length === 0) return "";
+    if (recentFacts.length > 0) {
+      parts.push("");
+      parts.push("Recent facts about Sensei:");
+      for (const f of recentFacts) {
+        parts.push(`- ${f.fact}`);
+      }
+    }
 
-    return blocks.map((r) => `[${r.tier}]: ${r.content}`).join("\n");
+    return parts.join("\n");
   }
 
   function insertFact(

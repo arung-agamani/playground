@@ -84,27 +84,42 @@ const actionHandlers: Record<string, ActionHandler> = {
     });
 
     try {
-      const result = await llm.chat({
-        model: llmConfig.model,
-        messages,
-        tools: filterProactiveTools(toolRegistry.definitions),
-        maxToolIterations: 3,
-      });
+      const proactiveTools = filterProactiveTools(toolRegistry.definitions);
+      let currentMessages = messages;
+      let responseText: string | null = null;
 
-      let responseText = result.content;
+      for (let round = 0; round < 4; round++) {
+        const result = await llm.chat({
+          model: llmConfig.model,
+          messages: currentMessages,
+          tools: proactiveTools.length > 0 ? proactiveTools : undefined,
+          maxToolIterations: 3,
+        });
 
-      if (responseText === null && result.messages.length > messages.length) {
-        const lastAsst = findLastAssistant(result.messages);
-        const toolCalls = extractToolCalls(lastAsst);
-        if (toolCalls.length > 0) {
-          const toolResults = await executeProactiveTools(ctx, toolCalls, row);
-          const followUpMessages = [...result.messages, ...toolResults];
-          const followUp = await llm.chat({
-            model: llmConfig.model,
-            messages: followUpMessages,
-          });
-          responseText = followUp.content;
+        if (result.content === null && result.messages.length > currentMessages.length) {
+          const lastAsst = findLastAssistant(result.messages);
+          const toolCalls = extractToolCalls(lastAsst);
+          if (toolCalls.length > 0) {
+            const toolResults = await executeProactiveTools(ctx, toolCalls, row);
+            currentMessages = [...result.messages, ...toolResults];
+            continue;
+          }
         }
+
+        if (result.content) {
+          responseText = result.content;
+          break;
+        }
+
+        break;
+      }
+
+      if (!responseText) {
+        const final = await llm.chat({
+          model: llmConfig.model,
+          messages: currentMessages,
+        });
+        responseText = final.content;
       }
 
       if (responseText) {

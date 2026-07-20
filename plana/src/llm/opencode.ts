@@ -36,7 +36,7 @@ export function createOpenCodeClient(baseUrl: string, apiKey: string) {
         messages: allMessages,
         tools: tools?.length ? tools : undefined,
         tool_choice: tools?.length ? "auto" : "none",
-        max_tokens: maxTokens ?? 2000,
+        max_tokens: maxTokens ?? 4000,
         ...(temperature !== undefined ? { temperature } : {}),
       });
 
