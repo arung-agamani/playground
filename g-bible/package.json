@@ -1,0 +1,22 @@
+{
+  "name": "g-bible",
+  "version": "0.1.0",
+  "description": "DeepSeek-powered multi-agent orchestrator — Blue Archive: Game Development Department & Millennium Science School themed agent pack for opencode",
+  "type": "module",
+  "keywords": [
+    "opencode",
+    "agent-orchestrator",
+    "deepseek",
+    "multi-agent",
+    "blue-archive",
+    "game-development-department",
+    "millennium"
+  ],
+  "author": "",
+  "license": "MIT",
+  "exports": {
+    ".": "./opencode.json",
+    "./agents/*": "./agents/*.md",
+    "./skills/*": "./skills/*/SKILL.md"
+  }
+}
