@@ -31,20 +31,57 @@ export function createLoreStore(db: PostgresJsDatabase<typeof schema>) {
   }
 
   async function search(query: string): Promise<Array<LoreRow & { rank: number }>> {
-    const tsquery = query.split(/\s+/).map((w) => `${w}:*`).join(" & ");
-    const rows = await db.execute(sql`
-      SELECT id, character_name, category, title, content, source,
-        ts_rank(
-          to_tsvector('english', content || ' ' || coalesce(title, '')),
-          to_tsquery('english', ${tsquery})
-        ) as rank
-      FROM ${schema.loreEntries}
-      WHERE to_tsvector('english', content || ' ' || coalesce(title, ''))
-        @@ to_tsquery('english', ${tsquery})
-      ORDER BY rank DESC
-      LIMIT 5
-    `);
-    return rows as unknown as Array<LoreRow & { rank: number }>;
+    if (!query.trim()) return [];
+
+    try {
+      const rows = await db.execute(sql`
+        SELECT id, character_name, category, title, content, source,
+          ts_rank(
+            to_tsvector('english', content || ' ' || coalesce(title, '')),
+            websearch_to_tsquery('english', ${query})
+          ) as rank
+        FROM ${schema.loreEntries}
+        WHERE to_tsvector('english', content || ' ' || coalesce(title, ''))
+          @@ websearch_to_tsquery('english', ${query})
+        ORDER BY rank DESC
+        LIMIT 5
+      `);
+      const results = rows as Array<LoreRow & { rank: number }>;
+
+      if (results.length < 2 && query.trim().length > 2) {
+        const terms = query.trim().split(/\s+/).filter(Boolean);
+        const fuzzy = await db.execute(sql`
+          SELECT id, character_name, category, title, content, source,
+            word_similarity(content || ' ' || coalesce(title, ''), ${query}) as rank
+          FROM ${schema.loreEntries}
+          WHERE ${sql.join(
+            terms.map((t) => sql`content ILIKE ${`%${t}%`}`),
+            sql` OR `
+          )}
+          ORDER BY rank DESC
+          LIMIT 5
+        `);
+        const fuzzyResults = fuzzy as Array<LoreRow & { rank: number }>;
+        if (fuzzyResults.length > results.length) return fuzzyResults;
+      }
+
+      return results;
+    } catch (e) {
+      const terms = query.trim().split(/\s+/).filter(Boolean);
+      if (terms.length === 0) return [];
+      const fuzzy = await db.execute(sql`
+        SELECT id, character_name, category, title, content, source,
+          word_similarity(content || ' ' || coalesce(title, ''), ${query}) as rank
+        FROM ${schema.loreEntries}
+        WHERE ${sql.join(
+          terms.map((t) => sql`content ILIKE ${`%${t}%`}`),
+          sql` OR `
+        )}
+        ORDER BY rank DESC
+        LIMIT 5
+      `);
+      return fuzzy as Array<LoreRow & { rank: number }>;
+    }
   }
 
   async function clear(): Promise<void> {

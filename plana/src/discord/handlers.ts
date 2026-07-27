@@ -10,6 +10,7 @@ import type { MemoryStore } from "../memory/store";
 import type { ThresholdState } from "../memory/thresholds";
 import { shouldRefresh, recordWrite, incrementCount } from "../memory/thresholds";
 import { runMemoryWriter, type WriterConfig } from "../memory/writer";
+import { MessageStreamer } from "./stream";
 import { log } from "../debug";
 
 export interface HandlerDeps {
@@ -244,29 +245,22 @@ export function createHandlers(deps: HandlerDeps) {
       if (!responseSent) {
         log.llmRequestFollowUp(activeModel, currentMessages);
 
-        const finalResult = await llm.chat({
+        const header = statusMsg
+          ? `🔧 *using ${allToolNames.join(", ")}* ✓`
+          : "";
+
+        const stream = llm.chatStream({
           model: activeModel,
           messages: currentMessages,
         });
 
-        if (finalResult.content) {
-          const text = stripTimestamp(finalResult.content);
+        const streamer = new MessageStreamer(message, statusMsg, header);
+        const fullText = await streamer.stream(stream);
 
-          if (statusMsg) {
-            const header = `🔧 *using ${allToolNames.join(", ")}* ✓`;
-            const resultPreview = truncateToolResults(allResultLines, header);
-            await statusMsg.edit({ content: resultPreview });
-          }
-
-          log.llmResponse("stop", text);
-          await store.saveMessage(guildId, channelId, "assistant", text);
-          log.responseSent(channelId, text);
-
-          if (statusMsg) {
-            await sendChunked(message, text);
-          } else {
-            await sendResponse(message, text);
-          }
+        if (fullText) {
+          log.llmResponse("stop", fullText);
+          await store.saveMessage(guildId, channelId, "assistant", fullText);
+          log.responseSent(channelId, fullText);
 
           scheduleMemoryRefresh(memoryStore, store, guildId, channelId, thresholdState, writerConfig);
         }

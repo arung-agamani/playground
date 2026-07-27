@@ -17,7 +17,7 @@ import {
 } from "../database/validation";
 
 export function createReminderTools(store: ReminderStore) {
-  function create(ctx: ToolContext, args: Record<string, unknown>): string {
+  async function create(ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
     const message = args.message as string;
     const when = args.when as string;
     const recurrenceStr = args.recurrence as string | undefined;
@@ -50,7 +50,7 @@ export function createReminderTools(store: ReminderStore) {
 
     let row;
     try {
-      row = store.create({
+      row = await store.create({
         guildId: ctx.guildId,
         channelId: ctx.channelId,
         userId: ctx.userId,
@@ -73,14 +73,14 @@ export function createReminderTools(store: ReminderStore) {
     ].join("\n");
   }
 
-  function edit(ctx: ToolContext, args: Record<string, unknown>): string {
+  async function edit(ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
     const id = args.reminder_id as number;
     const message = args.message as string | undefined;
     const when = args.when as string | undefined;
 
     if (!id) return "Error: reminder_id is required.";
 
-    const existing = store.getById(id);
+    const existing = await store.getById(id);
     if (!existing || existing.status !== "active") {
       return `Error: no active reminder found with id=${id}.`;
     }
@@ -98,29 +98,29 @@ export function createReminderTools(store: ReminderStore) {
       }
     }
 
-    const success = store.update(id, {
+    const success = await store.update(id, {
       message: message?.trim() || undefined,
       dueAt,
     });
 
     if (!success) return `Error: could not update reminder id=${id}.`;
 
-    const updated = store.getById(id);
+    const updated = await store.getById(id);
     const formatted = updated ? formatDueAt(updated.due_at, ctx.defaultTimezone) : "unknown";
     return `Reminder id=${id} updated. Due: ${formatted}`;
   }
 
-  function remove(_ctx: ToolContext, args: Record<string, unknown>): string {
+  async function remove(_ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
     const id = args.reminder_id as number;
     if (!id) return "Error: reminder_id is required.";
 
-    const success = store.cancel(id);
+    const success = await store.cancel(id);
     if (!success) return `Error: no active reminder found with id=${id}.`;
     return `Reminder id=${id} cancelled.`;
   }
 
-  function list(ctx: ToolContext): string {
-    const reminders = store.getActive(ctx.channelId);
+  async function list(ctx: ToolContext): Promise<string> {
+    const reminders = await store.getActive(ctx.channelId);
     if (reminders.length === 0) {
       return "No active reminders in this channel.";
     }
@@ -211,7 +211,7 @@ export function createTaskTools(store: TaskStore) {
     return parts.join("\n");
   }
 
-  function add(ctx: ToolContext, args: Record<string, unknown>): string {
+  async function add(ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
     const parsed = parseOrError(
       taskCreateSchema,
       {
@@ -227,20 +227,20 @@ export function createTaskTools(store: TaskStore) {
     if (!parsed.ok) return `Error: ${parsed.error}`;
 
     try {
-      const row = store.create(parsed.data);
+      const row = await store.create(parsed.data);
       return `Task added:\n${formatTask(row)}`;
     } catch (e) {
       return `Error: ${e instanceof Error ? e.message : "could not create task"}`;
     }
   }
 
-  function list(ctx: ToolContext, args: Record<string, unknown>): string {
+  async function list(ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
     const filter: { status?: string; priority?: string; category?: string } = {};
     if (args.status) filter.status = args.status as string;
     if (args.priority) filter.priority = args.priority as string;
     if (args.category) filter.category = args.category as string;
 
-    const tasks = store.list(ctx.userId, filter);
+    const tasks = await store.list(ctx.userId, filter);
 
     if (tasks.length === 0) {
       const filterDesc = Object.entries(filter)
@@ -251,7 +251,7 @@ export function createTaskTools(store: TaskStore) {
         : "No tasks yet. Use add_task to create one.";
     }
 
-    const counts = store.statusCounts(ctx.userId);
+    const counts = await store.statusCounts(ctx.userId);
     const summary = Object.entries(counts)
       .filter(([, n]) => n > 0)
       .map(([s, n]) => `${n} ${s}`)
@@ -260,7 +260,7 @@ export function createTaskTools(store: TaskStore) {
     return [`Tasks (${summary}):`, ...tasks.map(formatTask)].join("\n");
   }
 
-  function move(ctx: ToolContext, args: Record<string, unknown>): string {
+  async function move(ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
     const id = args.task_id as number;
     if (!id) return "Error: task_id is required.";
 
@@ -269,21 +269,21 @@ export function createTaskTools(store: TaskStore) {
       return `Error: invalid status. Use: backlog, ready, in-progress, done`;
     }
 
-    const task = store.getById(id);
+    const task = await store.getById(id);
     if (!task || task.user_id !== ctx.userId || task.archived) {
       return `Error: task #${id} not found.`;
     }
 
     const oldStatus = task.status;
-    store.move(id, statusParsed.data as TaskStatus);
+    await store.move(id, statusParsed.data as TaskStatus);
     return `"${task.title}" moved from ${oldStatus} → ${statusParsed.data}.`;
   }
 
-  function edit(ctx: ToolContext, args: Record<string, unknown>): string {
+  async function edit(ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
     const id = args.task_id as number;
     if (!id) return "Error: task_id is required.";
 
-    const task = store.getById(id);
+    const task = await store.getById(id);
     if (!task || task.user_id !== ctx.userId || task.archived) {
       return `Error: task #${id} not found.`;
     }
@@ -307,35 +307,35 @@ export function createTaskTools(store: TaskStore) {
     const parsed = parseOrError(taskUpdateSchema, fields, "edit_task");
     if (!parsed.ok) return `Error: ${parsed.error}`;
 
-    const success = store.update(id, parsed.data);
+    const success = await store.update(id, parsed.data);
     if (!success) return `Error: could not update task #${id}.`;
 
-    const updated = store.getById(id)!;
-    return `Task #${id} updated:\n${formatTask(updated)}`;
+    const updated = await store.getById(id);
+    return `Task #${id} updated:\n${formatTask(updated!)}`;
   }
 
-  function remove(ctx: ToolContext, args: Record<string, unknown>): string {
+  async function remove(ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
     const id = args.task_id as number;
     if (!id) return "Error: task_id is required.";
 
-    const task = store.getById(id);
+    const task = await store.getById(id);
     if (!task || task.user_id !== ctx.userId) {
       return `Error: task #${id} not found.`;
     }
 
     const title = task.title;
-    store.remove(id);
+    await store.remove(id);
     return `Task #${id} "${title}" deleted.`;
   }
 
-  function sprint(ctx: ToolContext, args: Record<string, unknown>): string {
+  async function sprint(ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
     const taskIds = args.task_ids as number[] | undefined;
 
     if (taskIds && taskIds.length > 0) {
-      return store.sprintSet(ctx.userId, taskIds);
+      return await store.sprintSet(ctx.userId, taskIds);
     }
 
-    const tasks = store.sprintList(ctx.userId);
+    const tasks = await store.sprintList(ctx.userId);
     if (tasks.length === 0) {
       return "Sprint is empty. Use sprint_set with task_ids to add tasks.";
     }
@@ -345,28 +345,28 @@ export function createTaskTools(store: TaskStore) {
     );
   }
 
-  function sprintSet(ctx: ToolContext, args: Record<string, unknown>): string {
+  async function sprintSet(ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
     const taskIds = args.task_ids as number[] | undefined;
-    if (!taskIds || taskIds.length === 0) return store.sprintSet(ctx.userId, []);
-    return store.sprintSet(ctx.userId, taskIds);
+    if (!taskIds || taskIds.length === 0) return await store.sprintSet(ctx.userId, []);
+    return await store.sprintSet(ctx.userId, taskIds);
   }
 
-  function sprintClear(ctx: ToolContext): string {
-    store.sprintClear(ctx.userId);
+  async function sprintClear(ctx: ToolContext): Promise<string> {
+    await store.sprintClear(ctx.userId);
     return "Sprint cleared.";
   }
 
-  function archive(ctx: ToolContext): string {
-    const n = store.archiveDone(ctx.userId);
+  async function archive(ctx: ToolContext): Promise<string> {
+    const n = await store.archiveDone(ctx.userId);
     return n === 0
       ? "No completed tasks to archive."
       : `${n} completed task(s) archived.`;
   }
 
-  function daily(ctx: ToolContext): string {
-    const tasks = store.list(ctx.userId);
-    const counts = store.statusCounts(ctx.userId);
-    const deadlines = store.upcomingDeadlines(ctx.userId);
+  async function daily(ctx: ToolContext): Promise<string> {
+    const tasks = await store.list(ctx.userId);
+    const counts = await store.statusCounts(ctx.userId);
+    const deadlines = await store.upcomingDeadlines(ctx.userId);
 
     const lines: string[] = [];
     lines.push("☀ Morning Digest");

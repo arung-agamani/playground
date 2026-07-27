@@ -16,6 +16,11 @@ export interface LlmCallResult {
   finishReason: string;
 }
 
+export interface StreamToken {
+  token: string;
+  type: "content" | "reasoning";
+}
+
 export function createOpenCodeClient(baseUrl: string, apiKey: string) {
   const client = new OpenAI({
     baseURL: baseUrl,
@@ -88,5 +93,32 @@ export function createOpenCodeClient(baseUrl: string, apiKey: string) {
     };
   }
 
-  return { chat };
+  async function* chatStream(options: LlmCallOptions): AsyncGenerator<StreamToken> {
+    const { model, messages, tools, temperature, maxTokens } = options;
+
+    const stream = await client.chat.completions.create({
+      model,
+      messages,
+      tools: tools?.length ? tools : undefined,
+      tool_choice: tools?.length ? "auto" : "none",
+      stream: true,
+      max_tokens: maxTokens ?? 4000,
+      ...(temperature !== undefined ? { temperature } : {}),
+    });
+
+    for await (const chunk of stream) {
+      const delta = chunk.choices?.[0]?.delta;
+      if (!delta) continue;
+
+      if (delta.content) {
+        yield { token: delta.content, type: "content" };
+      }
+
+      if (delta.reasoning_content) {
+        yield { token: delta.reasoning_content, type: "reasoning" };
+      }
+    }
+  }
+
+  return { chat, chatStream };
 }

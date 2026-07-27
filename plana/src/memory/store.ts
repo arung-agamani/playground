@@ -234,10 +234,10 @@ export function createMemoryStore(db: PostgresJsDatabase<typeof schema>) {
       SELECT m.id, m.tier, m.content,
         ts_rank(
           to_tsvector('english', m.content),
-          plainto_tsquery('english', ${query})
+          websearch_to_tsquery('english', ${query})
         ) as rank
       FROM ${schema.memories} m
-      WHERE to_tsvector('english', m.content) @@ plainto_tsquery('english', ${query})
+      WHERE to_tsvector('english', m.content) @@ websearch_to_tsquery('english', ${query})
       ORDER BY rank DESC
       LIMIT 5
     `);
@@ -253,16 +253,36 @@ export function createMemoryStore(db: PostgresJsDatabase<typeof schema>) {
       SELECT pf.id, pf.fact, pf.confidence,
         ts_rank(
           to_tsvector('english', pf.fact),
-          plainto_tsquery('english', ${query})
+          websearch_to_tsquery('english', ${query})
         ) as rank
       FROM ${schema.pinnedFacts} pf
-      WHERE to_tsvector('english', pf.fact) @@ plainto_tsquery('english', ${query})
+      WHERE to_tsvector('english', pf.fact) @@ websearch_to_tsquery('english', ${query})
       ORDER BY rank DESC
       LIMIT 5
     `);
-    return (rows as Array<{ id: number; fact: string; confidence: number; rank: number }>).map(
+    const results = (rows as Array<{ id: number; fact: string; confidence: number; rank: number }>).map(
       (r) => ({ ...r, fact: decrypt(r.fact) ?? r.fact }),
     );
+
+    if (results.length < 2 && query.trim().length > 2) {
+      const terms = query.trim().split(/\s+/).filter(Boolean);
+      const ilikeClauses = terms.map((t) => sql`pf.fact ILIKE ${`%${t}%`}`);
+      const fuzzy = await db.execute(sql`
+        SELECT pf.id, pf.fact, pf.confidence,
+          word_similarity(pf.fact, ${query}) as rank
+        FROM ${schema.pinnedFacts} pf
+        WHERE ${sql.join(ilikeClauses, sql` OR `)}
+          OR word_similarity(pf.fact, ${query}) > 0.1
+        ORDER BY rank DESC
+        LIMIT 5
+      `);
+      const fuzzyResults = (fuzzy as Array<{ id: number; fact: string; confidence: number; rank: number }>).map(
+        (r) => ({ ...r, fact: decrypt(r.fact) ?? r.fact }),
+      );
+      if (fuzzyResults.length > results.length) return fuzzyResults;
+    }
+
+    return results;
   }
 
   async function decayAndCleanup(): Promise<{ decayed: number; cleaned: number }> {
