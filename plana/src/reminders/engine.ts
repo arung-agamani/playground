@@ -8,6 +8,7 @@ import type { MemoryStore } from "../memory/store";
 import type { ToolRegistry } from "../tools/registry";
 import { PROACTIVE_ALLOWED_TOOLS } from "../tools/registry";
 import type { PersonaDefinition } from "../persona/types";
+import { nowIso } from "../database/time";
 import { log } from "../debug";
 
 type ActionContext = {
@@ -47,9 +48,9 @@ const actionHandlers: Record<string, ActionHandler> = {
     const { client, convStore, memStore, persona, toolRegistry, timezone, llmConfig } = ctx;
     const llm = createOpenCodeClient(llmConfig.baseUrl, llmConfig.apiKey);
     const systemPrompt = compileSystemPrompt(persona);
-    const memoryBlock = memStore.buildMemoryBlock();
+    const memoryBlock = await memStore.buildMemoryBlock();
 
-    const hasRecentActivity = checkRecentActivity(convStore, row.guild_id, row.channel_id);
+    const hasRecentActivity = await checkRecentActivity(convStore, row.guild_id, row.channel_id);
     if (hasRecentActivity) {
       log.info(`Greeting skipped: user was active recently in ${row.channel_id}`);
       return;
@@ -57,7 +58,7 @@ const actionHandlers: Record<string, ActionHandler> = {
 
     log.info(`Greeting: preparing morning message for ${row.channel_id}`);
 
-    const messages = [
+    const messages: any = [
       { role: "system" as const, content: systemPrompt },
     ];
     if (memoryBlock) {
@@ -127,7 +128,7 @@ const actionHandlers: Record<string, ActionHandler> = {
         const channel = (await client.channels.fetch(row.channel_id)) as TextChannel | null;
         if (channel) {
           await channel.send(clean);
-          convStore.saveMessage(row.guild_id, row.channel_id, "assistant", clean);
+          await convStore.saveMessage(row.guild_id, row.channel_id, "assistant", clean);
           log.info(`Greeting sent to ${row.channel_id}`);
         }
       }
@@ -138,7 +139,7 @@ const actionHandlers: Record<string, ActionHandler> = {
 
   async nudge(ctx, row) {
     const { client, convStore } = ctx;
-    const hasRecentActivity = checkRecentActivity(convStore, row.guild_id, row.channel_id);
+    const hasRecentActivity = await checkRecentActivity(convStore, row.guild_id, row.channel_id);
     if (hasRecentActivity) {
       log.info(`Nudge skipped: user was active recently in ${row.channel_id}`);
       return;
@@ -148,7 +149,7 @@ const actionHandlers: Record<string, ActionHandler> = {
     if (!channel) return;
 
     await channel.send(`<@${row.user_id}> Sensei, I hope you are okay... I wanted to check in on you.`);
-    convStore.saveMessage(row.guild_id, row.channel_id, "assistant", "Sensei, I hope you are okay... I wanted to check in on you.");
+    await convStore.saveMessage(row.guild_id, row.channel_id, "assistant", "Sensei, I hope you are okay... I wanted to check in on you.");
     log.info(`Nudge sent to ${row.channel_id}`);
   },
 };
@@ -166,49 +167,68 @@ export interface EngineDeps {
   llmConfig: { baseUrl: string; apiKey: string; model: string };
 }
 
-export function startReminderEngine(deps: EngineDeps, pollIntervalMs = 15_000) {
-  const { client, reminderStore } = deps;
+const MIN_POLL_MS = 15_000;
+const MAX_POLL_MS = 120_000;
+
+export async function startReminderEngine(deps: EngineDeps, baseIntervalMs = MIN_POLL_MS) {
+  const { reminderStore } = deps;
   let pollCount = 0;
+  let currentInterval = baseIntervalMs;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let stopped = false;
 
-  log.info(`Reminder engine: starting (poll=${pollIntervalMs}ms)...`);
+  log.info(`Reminder engine: starting (base poll=${baseIntervalMs}ms, backoff to ${MAX_POLL_MS}ms)...`);
 
-  const dueNow = reminderStore.getDue();
+  const dueNow = await reminderStore.getDue();
   if (dueNow.length > 0) {
     log.info(`Reminder engine: startup — executing ${dueNow.length} pending action(s)`);
     for (const row of dueNow.slice(0, 50)) {
-      executeAction(deps, row);
+      await executeAction(deps, row);
     }
   } else {
     log.info("Reminder engine: no pending actions on startup");
   }
 
-  const timer = setInterval(() => {
-    pollCount++;
-    poll(deps);
+  function scheduleNext() {
+    if (stopped) return;
+    timer = setTimeout(async () => {
+      pollCount++;
+      const found = await poll(deps);
+      if (found > 0) {
+        currentInterval = baseIntervalMs;
+      } else {
+        currentInterval = Math.min(currentInterval * 2, MAX_POLL_MS);
+      }
+      if (pollCount % 4 === 0) {
+        log.debug(
+          `Reminder engine: heartbeat (poll #${pollCount}, interval=${currentInterval}ms)`,
+        );
+      }
+      scheduleNext();
+    }, currentInterval);
+  }
 
-    if (pollCount % 4 === 0) {
-      log.debug(`Reminder engine: heartbeat (poll #${pollCount}, alive)`);
-    }
-  }, pollIntervalMs);
-
+  scheduleNext();
   log.info("Reminder engine: started");
 
   return {
     stop() {
-      clearInterval(timer);
+      stopped = true;
+      if (timer) clearTimeout(timer);
       log.info(`Reminder engine: stopped (${pollCount} polls total)`);
     },
   };
 }
 
-async function poll(deps: EngineDeps) {
-  const dueReminders = deps.reminderStore.getDue();
+async function poll(deps: EngineDeps): Promise<number> {
+  const dueReminders = await deps.reminderStore.getDue();
   if (dueReminders.length > 0) {
     log.info(`Reminder engine: poll found ${dueReminders.length} due action(s)`);
   }
   for (const row of dueReminders) {
     await executeAction(deps, row);
   }
+  return dueReminders.length;
 }
 
 async function executeAction(deps: EngineDeps, row: {
@@ -245,15 +265,19 @@ async function executeAction(deps: EngineDeps, row: {
     if (row.type === "recurring" && row.recurrence) {
       const spec = parseRecurrence(row.recurrence);
       if (spec) {
-        const nextDue = computeNextDue(row.due_at, spec);
-        deps.reminderStore.reschedule(row.id, nextDue);
+        let nextDue = computeNextDue(row.due_at, spec);
+        const now = nowIso();
+        while (nextDue <= now) {
+          nextDue = computeNextDue(nextDue, spec);
+        }
+        await deps.reminderStore.reschedule(row.id, nextDue);
         log.info(`Reminder engine: rescheduled id=${row.id} next=${nextDue} recurrence=${row.recurrence}`);
       } else {
-        deps.reminderStore.complete(row.id);
+        await deps.reminderStore.complete(row.id);
         log.info(`Reminder engine: completed (bad recurrence) id=${row.id}`);
       }
     } else {
-      deps.reminderStore.complete(row.id);
+      await deps.reminderStore.complete(row.id);
       log.info(`Reminder engine: completed id=${row.id}`);
     }
   } catch (error) {
@@ -263,8 +287,8 @@ async function executeAction(deps: EngineDeps, row: {
 
 // ── Helpers ─────────────────────────────────────────────
 
-function checkRecentActivity(convStore: ConversationStore, guildId: string, channelId: string): boolean {
-  const messages = convStore.getMessages(guildId, channelId);
+async function checkRecentActivity(convStore: ConversationStore, guildId: string, channelId: string): Promise<boolean> {
+  const messages = await convStore.getMessages(guildId, channelId);
   const today = new Date().toISOString().slice(0, 10);
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]!;

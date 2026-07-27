@@ -3,6 +3,11 @@ import type { ConversationStore } from "../conversation/store";
 import type { MemoryStore } from "./store";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { log } from "../debug";
+import {
+  writerOutputSchema,
+  memoryTierSchema,
+  parseOrError,
+} from "../database/validation";
 
 export interface WriterConfig {
   opencodeBaseUrl: string;
@@ -19,8 +24,8 @@ export async function runMemoryWriter(
 ): Promise<void> {
   const llm = createOpenCodeClient(config.opencodeBaseUrl, config.opencodeApiKey);
 
-  const oldSummaries = memStore.getAllMemories();
-  const messages = convStore.getMessages(guildId, channelId);
+  const oldSummaries = await memStore.getAllMemories();
+  const messages = await convStore.getMessages(guildId, channelId);
   const recent = messages.slice(-30);
 
   const conversationText = recent
@@ -113,14 +118,10 @@ export async function runMemoryWriter(
 
     log.info(`Memory writer: response received (${result.content.length}c, finish=${result.finishReason})`);
 
-    let parsed: {
-      summaries?: Record<string, string>;
-      facts?: Array<{ fact: string; confidence: number; nature?: string }>;
-    };
-
+    let raw: unknown;
     try {
       const clean = result.content.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-      parsed = JSON.parse(clean);
+      raw = JSON.parse(clean);
     } catch {
       log.warn("Memory writer: failed to parse LLM response as JSON");
       log.warn("--- RAW RESPONSE START ---");
@@ -129,18 +130,29 @@ export async function runMemoryWriter(
       return;
     }
 
+    const validated = parseOrError(writerOutputSchema, raw, "memory_writer");
+    if (!validated.ok) {
+      log.warn(`Memory writer: schema validation failed — ${validated.error}`);
+      return;
+    }
+    const parsed = validated.data;
+
     if (parsed.summaries) {
-      const { decayed, cleaned } = memStore.decayAndCleanup();
+      const { decayed, cleaned } = await memStore.decayAndCleanup();
       if (decayed > 0 || cleaned > 0) {
         log.info(`Memory writer: decayed ${decayed} facts, cleaned ${cleaned} stale`);
       }
 
       for (const [tier, content] of Object.entries(parsed.summaries)) {
-        if (typeof content === "string" && content.trim()) {
-          memStore.upsertMemory(tier as "lifetime" | "monthly" | "weekly" | "daily", content.trim());
+        const tierOk = parseOrError(memoryTierSchema, tier, "memory_writer.tier");
+        if (!tierOk.ok || typeof content !== "string" || !content.trim()) continue;
+        try {
+          await memStore.upsertMemory(tierOk.data, content.trim());
           log.info(
             `Memory writer: wrote [${tier}] (${content.trim().length}c) "${content.trim().slice(0, 80)}${content.trim().length > 80 ? "…" : ""}"`,
           );
+        } catch (e) {
+          log.warn(`Memory writer: skip tier ${tier}: ${e instanceof Error ? e.message : e}`);
         }
       }
     }
@@ -149,20 +161,23 @@ export async function runMemoryWriter(
       let added = 0;
       let merged = 0;
       for (const f of parsed.facts) {
-        if (typeof f.fact === "string" && f.fact.trim() && f.confidence > 0.5) {
+        if (f.confidence <= 0.5) continue;
+        try {
           const nature = f.nature === "persistent" ? "persistent" : "temporal";
-          const result = memStore.insertFact(f.fact.trim(), {
+          const insertResult = await memStore.insertFact(f.fact.trim(), {
             source: "memory_writer",
-            confidence: f.confidence,
+            confidence: Math.min(1, Math.max(0, f.confidence)),
             nature,
           });
-          if (result.merged) merged++;
+          if (insertResult.merged) merged++;
           else added++;
+        } catch (e) {
+          log.warn(`Memory writer: skip fact: ${e instanceof Error ? e.message : e}`);
         }
       }
       if (added > 0 || merged > 0) {
-        const previews = parsed.facts!
-          .filter((f) => typeof f.fact === "string" && f.fact.trim() && f.confidence > 0.5)
+        const previews = parsed.facts
+          .filter((f) => f.confidence > 0.5)
           .map((f) => `"${f.fact}" (${f.confidence} ${f.nature ?? "temporal"})`)
           .join(", ");
         log.info(`Memory writer: extracted ${added} new + ${merged} merged fact(s): ${previews}`);

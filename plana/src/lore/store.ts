@@ -1,4 +1,7 @@
-import { Database } from "bun:sqlite";
+import { sql } from "drizzle-orm";
+import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
+import * as schema from "../database";
+import { nowIso } from "../database/time";
 
 export interface LoreRow {
   id: number;
@@ -9,83 +12,49 @@ export interface LoreRow {
   source: string;
 }
 
-export function createLoreStore(dbPath: string) {
-  const db = new Database(dbPath);
-
-  db.exec("PRAGMA journal_mode = WAL");
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS lore_entries (
-      id             INTEGER PRIMARY KEY AUTOINCREMENT,
-      character_name TEXT NOT NULL,
-      category       TEXT NOT NULL,
-      title          TEXT NOT NULL,
-      content        TEXT NOT NULL,
-      source         TEXT,
-      created_at     TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-  `);
-
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS lore_fts USING fts5(
-      character_name,
-      category,
-      title,
-      content,
-      content=lore_entries,
-      content_rowid=id
-    )
-  `);
-
-  const insertStmt = db.prepare(`
-    INSERT INTO lore_entries (character_name, category, title, content, source)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-
-  const searchStmt = db.prepare(`
-    SELECT lore_entries.*, bm25(lore_fts) as rank
-    FROM lore_fts
-    JOIN lore_entries ON lore_entries.id = lore_fts.rowid
-    WHERE lore_fts MATCH ?
-    ORDER BY rank
-    LIMIT 5
-  `);
-
-  const clearStmt = db.prepare(`DELETE FROM lore_entries`);
-
-  function insert(params: {
+export function createLoreStore(db: PostgresJsDatabase<typeof schema>) {
+  async function insert(params: {
     characterName: string;
     category: string;
     title: string;
     content: string;
     source?: string;
-  }): void {
-    insertStmt.run(
-      params.characterName,
-      params.category,
-      params.title,
-      params.content,
-      params.source ?? null,
-    );
+  }): Promise<void> {
+    await db.insert(schema.loreEntries).values({
+      character_name: params.characterName,
+      category: params.category,
+      title: params.title,
+      content: params.content,
+      source: params.source ?? null,
+      created_at: sql`${nowIso()}::timestamp`,
+    });
   }
 
-  function search(query: string): Array<LoreRow & { rank: number }> {
-    const ftsQuery = query.split(/\s+/).map((w) => `"${w}"`).join(" OR ");
-    return searchStmt.all(ftsQuery) as Array<LoreRow & { rank: number }>;
+  async function search(query: string): Promise<Array<LoreRow & { rank: number }>> {
+    const tsquery = query.split(/\s+/).map((w) => `${w}:*`).join(" & ");
+    const rows = await db.execute(sql`
+      SELECT id, character_name, category, title, content, source,
+        ts_rank(
+          to_tsvector('english', content || ' ' || coalesce(title, '')),
+          to_tsquery('english', ${tsquery})
+        ) as rank
+      FROM ${schema.loreEntries}
+      WHERE to_tsvector('english', content || ' ' || coalesce(title, ''))
+        @@ to_tsquery('english', ${tsquery})
+      ORDER BY rank DESC
+      LIMIT 5
+    `);
+    return rows as unknown as Array<LoreRow & { rank: number }>;
   }
 
-  function clear(): void {
-    clearStmt.run();
-    db.exec("INSERT INTO lore_fts(lore_fts) VALUES('rebuild')");
+  async function clear(): Promise<void> {
+    await db.delete(schema.loreEntries);
   }
 
-  function rebuild(): void {
-    db.exec("INSERT INTO lore_fts(lore_fts) VALUES('rebuild')");
+  async function rebuild(): Promise<void> {
   }
 
-  function close(): void {
-    db.close();
-  }
+  function close(): void {}
 
   return { insert, search, clear, rebuild, close };
 }

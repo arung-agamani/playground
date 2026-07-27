@@ -9,7 +9,7 @@ export interface ConversationContext {
 }
 
 const MAX_CONTEXT_TOKENS = 32000;
-const MAX_HISTORY_MESSAGES = 60;
+const MAX_HISTORY_MESSAGES = 30;
 
 const MONTHS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -42,15 +42,15 @@ function formatTs(isoString: string, timezone: string): string {
 }
 
 export function createConversationManager(store: ConversationStore) {
-  function buildContext(
+  async function buildContext(
     guildId: string,
     channelId: string,
     systemPrompt: string,
     timezone: string,
-  ): ConversationContext {
+  ): Promise<ConversationContext> {
     const systemTokens = estimateTokens(systemPrompt);
     const availableForHistory = MAX_CONTEXT_TOKENS - systemTokens - 500;
-    const rows = store.getMessages(guildId, channelId);
+    const rows = await store.getMessages(guildId, channelId);
 
     const messages: ChatCompletionMessageParam[] = [];
     let historyTokens = 0;
@@ -105,15 +105,15 @@ export function createConversationManager(store: ConversationStore) {
     };
   }
 
-  function buildApiMessages(
+  async function buildApiMessages(
     guildId: string,
     channelId: string,
     systemPrompt: string,
     currentMessage: string,
     timezone: string,
     memoryBlock?: string,
-  ): ChatCompletionMessageParam[] {
-    const ctx = buildContext(guildId, channelId, systemPrompt, timezone);
+  ): Promise<ChatCompletionMessageParam[]> {
+    const ctx = await buildContext(guildId, channelId, systemPrompt, timezone);
 
     const apiMessages: ChatCompletionMessageParam[] = [
       { role: "system", content: systemPrompt },

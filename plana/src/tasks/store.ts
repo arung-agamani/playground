@@ -1,4 +1,14 @@
-import { Database } from "bun:sqlite";
+import { eq, and, sql } from "drizzle-orm";
+import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
+import * as schema from "../database";
+import { nowIso } from "../database/time";
+import { encrypt, decrypt } from "../database/crypto";
+import {
+  taskCreateSchema,
+  taskUpdateSchema,
+  taskStatusSchema,
+  parseOrError,
+} from "../database/validation";
 
 export type TaskStatus = "backlog" | "ready" | "in-progress" | "done";
 export type TaskPriority = "low" | "medium" | "high" | "critical";
@@ -18,230 +28,167 @@ export interface TaskRow {
   sprint: number;
 }
 
-export function createTaskStore(dbPath: string) {
-  const db = new Database(dbPath);
+const SORT_STATUS = sql`CASE status WHEN 'in-progress' THEN 1 WHEN 'ready' THEN 2 WHEN 'backlog' THEN 3 WHEN 'done' THEN 4 END`;
+const SORT_PRIORITY = sql`CASE priority WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 END`;
 
-  db.exec("PRAGMA journal_mode = WAL");
+export function createTaskStore(db: PostgresJsDatabase<typeof schema>) {
+  function decodeRow(row: TaskRow): TaskRow {
+    return {
+      ...row,
+      notes: decrypt(row.notes),
+    };
+  }
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS tasks (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id     TEXT NOT NULL,
-      title       TEXT NOT NULL,
-      status      TEXT NOT NULL DEFAULT 'backlog'
-                  CHECK(status IN ('backlog', 'ready', 'in-progress', 'done')),
-      priority    TEXT NOT NULL DEFAULT 'medium'
-                  CHECK(priority IN ('low', 'medium', 'high', 'critical')),
-      category    TEXT NOT NULL DEFAULT 'Other',
-      notes       TEXT,
-      deadline    TEXT,
-      created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
-      archived    INTEGER NOT NULL DEFAULT 0,
-      sprint      INTEGER NOT NULL DEFAULT 0
-    )
-  `);
-
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_tasks_user_status
-    ON tasks(user_id, status, archived)
-  `);
-
-  const insertStmt = db.prepare(`
-    INSERT INTO tasks (user_id, title, status, priority, category, notes, deadline)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  const getByIdStmt = db.prepare(`SELECT * FROM tasks WHERE id = ?`);
-
-  const listStmt = db.prepare(`
-    SELECT * FROM tasks
-    WHERE user_id = ? AND archived = 0
-    ORDER BY
-      CASE status
-        WHEN 'in-progress' THEN 1
-        WHEN 'ready' THEN 2
-        WHEN 'backlog' THEN 3
-        WHEN 'done' THEN 4
-      END,
-      CASE priority
-        WHEN 'critical' THEN 1
-        WHEN 'high' THEN 2
-        WHEN 'medium' THEN 3
-        WHEN 'low' THEN 4
-      END,
-      created_at ASC
-  `);
-
-  const listByStatusStmt = db.prepare(`
-    SELECT * FROM tasks
-    WHERE user_id = ? AND status = ? AND archived = 0
-    ORDER BY
-      CASE priority
-        WHEN 'critical' THEN 1 WHEN 'high' THEN 2
-        WHEN 'medium' THEN 3 WHEN 'low' THEN 4
-      END,
-      created_at ASC
-  `);
-
-  const listByPriorityStmt = db.prepare(`
-    SELECT * FROM tasks
-    WHERE user_id = ? AND priority = ? AND archived = 0
-    ORDER BY status, created_at ASC
-  `);
-
-  const listByCategoryStmt = db.prepare(`
-    SELECT * FROM tasks
-    WHERE user_id = ? AND category = ? AND archived = 0
-    ORDER BY status, priority, created_at ASC
-  `);
-
-  const listSprintStmt = db.prepare(`
-    SELECT * FROM tasks
-    WHERE user_id = ? AND sprint = 1 AND archived = 0
-    ORDER BY status, priority, created_at ASC
-  `);
-
-  const updateStmt = db.prepare(`
-    UPDATE tasks
-    SET title = COALESCE(?, title),
-        status = COALESCE(?, status),
-        priority = COALESCE(?, priority),
-        category = COALESCE(?, category),
-        notes = COALESCE(?, notes),
-        deadline = COALESCE(?, deadline),
-        updated_at = datetime('now')
-    WHERE id = ? AND archived = 0
-  `);
-
-  const moveStmt = db.prepare(`
-    UPDATE tasks SET status = ?, updated_at = datetime('now')
-    WHERE id = ? AND archived = 0
-  `);
-
-  const deleteStmt = db.prepare(`
-    DELETE FROM tasks WHERE id = ? AND archived = 0
-  `);
-
-  const archiveDoneStmt = db.prepare(`
-    UPDATE tasks SET archived = 1, updated_at = datetime('now')
-    WHERE user_id = ? AND status = 'done' AND archived = 0
-  `);
-
-  const setSprintStmt = db.prepare(`
-    UPDATE tasks SET sprint = ?, updated_at = datetime('now')
-    WHERE id = ? AND archived = 0
-  `);
-
-  const clearSprintStmt = db.prepare(`
-    UPDATE tasks SET sprint = 0
-    WHERE user_id = ? AND sprint = 1
-  `);
-
-  const countByStatusStmt = db.prepare(`
-    SELECT status, COUNT(*) as n FROM tasks
-    WHERE user_id = ? AND archived = 0
-    GROUP BY status
-  `);
-
-  const upcomingDeadlinesStmt = db.prepare(`
-    SELECT * FROM tasks
-    WHERE user_id = ? AND deadline IS NOT NULL AND deadline >= datetime('now') AND archived = 0 AND status != 'done'
-    ORDER BY deadline ASC
-    LIMIT 5
-  `);
-
-  function create(params: {
+  async function create(params: {
     userId: string;
     title: string;
     priority?: TaskPriority;
     category?: string;
     notes?: string;
     deadline?: string;
-  }): TaskRow {
-    const result = insertStmt.run(
-      params.userId,
-      params.title,
-      "backlog",
-      params.priority ?? "medium",
-      params.category ?? "Other",
-      params.notes ?? null,
-      params.deadline ?? null,
-    );
-    return getByIdStmt.get(result.lastInsertRowid) as TaskRow;
+  }): Promise<TaskRow> {
+    const parsed = parseOrError(taskCreateSchema, params, "task.create");
+    if (!parsed.ok) throw new Error(parsed.error);
+
+    const ts = nowIso();
+    const [row] = await db.insert(schema.tasks).values({
+      user_id: parsed.data.userId,
+      title: parsed.data.title,
+      status: "backlog",
+      priority: parsed.data.priority ?? "medium",
+      category: parsed.data.category ?? "Other",
+      notes: encrypt(parsed.data.notes ?? null),
+      deadline: parsed.data.deadline ? sql`${parsed.data.deadline}::timestamp` : null,
+      created_at: sql`${ts}::timestamp`,
+      updated_at: sql`${ts}::timestamp`,
+    }).returning();
+    return decodeRow(row as unknown as TaskRow);
   }
 
-  function getById(id: number): TaskRow | null {
-    return (getByIdStmt.get(id) as TaskRow) ?? null;
+  async function getById(id: number): Promise<TaskRow | null> {
+    const [row] = await db.select().from(schema.tasks)
+      .where(eq(schema.tasks.id, id)).limit(1);
+    return row ? decodeRow(row as unknown as TaskRow) : null;
   }
 
-  function list(userId: string, filter?: { status?: string; priority?: string; category?: string }): TaskRow[] {
-    if (filter?.status) {
-      return listByStatusStmt.all(userId, filter.status) as TaskRow[];
-    }
-    if (filter?.priority) {
-      return listByPriorityStmt.all(userId, filter.priority) as TaskRow[];
-    }
-    if (filter?.category) {
-      return listByCategoryStmt.all(userId, filter.category) as TaskRow[];
-    }
-    return listStmt.all(userId) as TaskRow[];
+  async function list(
+    userId: string,
+    filter?: { status?: string; priority?: string; category?: string },
+  ): Promise<TaskRow[]> {
+    const conditions = [
+      eq(schema.tasks.user_id, userId),
+      eq(schema.tasks.archived, 0),
+    ];
+    if (filter?.status) conditions.push(eq(schema.tasks.status, filter.status as TaskStatus));
+    if (filter?.priority) conditions.push(eq(schema.tasks.priority, filter.priority as TaskPriority));
+    if (filter?.category) conditions.push(eq(schema.tasks.category, filter.category));
+
+    const rows = await db.select().from(schema.tasks)
+      .where(and(...conditions))
+      .orderBy(SORT_STATUS, SORT_PRIORITY, schema.tasks.created_at);
+    return (rows as unknown as TaskRow[]).map(decodeRow);
   }
 
-  function move(id: number, status: TaskStatus): boolean {
-    const result = moveStmt.run(status, id);
-    return result.changes > 0;
+  async function move(id: number, status: TaskStatus): Promise<boolean> {
+    const parsed = parseOrError(taskStatusSchema, status, "task.move");
+    if (!parsed.ok) throw new Error(parsed.error);
+
+    const [row] = await db.update(schema.tasks)
+      .set({ status: parsed.data as TaskStatus, updated_at: sql`${nowIso()}::timestamp` })
+      .where(and(eq(schema.tasks.id, id), eq(schema.tasks.archived, 0)))
+      .returning();
+    return !!row;
   }
 
-  function update(
+  async function update(
     id: number,
-    fields: { title?: string; priority?: string; category?: string; notes?: string; deadline?: string },
-  ): boolean {
-    const result = updateStmt.run(
-      fields.title ?? null,
-      null,
-      fields.priority ?? null,
-      fields.category ?? null,
-      fields.notes ?? null,
-      fields.deadline ?? null,
-      id,
-    );
-    return result.changes > 0;
+    fields: {
+      title?: string;
+      priority?: string;
+      category?: string;
+      notes?: string;
+      deadline?: string;
+    },
+  ): Promise<boolean> {
+    const parsed = parseOrError(taskUpdateSchema, fields, "task.update");
+    if (!parsed.ok) throw new Error(parsed.error);
+
+    const updateData: Record<string, unknown> = { updated_at: sql`${nowIso()}::timestamp` };
+    if (parsed.data.title !== undefined) updateData.title = parsed.data.title;
+    if (parsed.data.priority !== undefined) updateData.priority = parsed.data.priority;
+    if (parsed.data.category !== undefined) updateData.category = parsed.data.category;
+    if (parsed.data.notes !== undefined) updateData.notes = encrypt(parsed.data.notes);
+    if (parsed.data.deadline !== undefined) updateData.deadline = parsed.data.deadline ? sql`${parsed.data.deadline}::timestamp` : null;
+
+    const [row] = await db.update(schema.tasks)
+      .set(updateData)
+      .where(and(eq(schema.tasks.id, id), eq(schema.tasks.archived, 0)))
+      .returning();
+    return !!row;
   }
 
-  function remove(id: number): boolean {
-    const result = deleteStmt.run(id);
-    return result.changes > 0;
+  async function remove(id: number): Promise<boolean> {
+    const [row] = await db.delete(schema.tasks)
+      .where(and(eq(schema.tasks.id, id), eq(schema.tasks.archived, 0)))
+      .returning();
+    return !!row;
   }
 
-  function sprintSet(userId: string, taskIds: number[]): string {
-    clearSprintStmt.run(userId);
+  async function sprintSet(userId: string, taskIds: number[]): Promise<string> {
+    await db.update(schema.tasks)
+      .set({ sprint: 0 })
+      .where(and(eq(schema.tasks.user_id, userId), eq(schema.tasks.sprint, 1)));
+
     let added = 0;
     for (const id of taskIds) {
-      const task = getById(id);
+      const task = await getById(id);
       if (task && task.user_id === userId && task.archived === 0) {
-        setSprintStmt.run(1, id);
+        await db.update(schema.tasks)
+          .set({ sprint: 1, updated_at: sql`${nowIso()}::timestamp` })
+          .where(eq(schema.tasks.id, id));
         added++;
       }
     }
     return `Sprint set with ${added} task(s).`;
   }
 
-  function sprintList(userId: string): TaskRow[] {
-    return listSprintStmt.all(userId) as TaskRow[];
+  async function sprintList(userId: string): Promise<TaskRow[]> {
+    const rows = await db.select().from(schema.tasks)
+      .where(and(
+        eq(schema.tasks.user_id, userId),
+        eq(schema.tasks.sprint, 1),
+        eq(schema.tasks.archived, 0),
+      ))
+      .orderBy(SORT_STATUS, SORT_PRIORITY, schema.tasks.created_at);
+    return (rows as unknown as TaskRow[]).map(decodeRow);
   }
 
-  function sprintClear(userId: string): void {
-    clearSprintStmt.run(userId);
+  async function sprintClear(userId: string): Promise<void> {
+    await db.update(schema.tasks)
+      .set({ sprint: 0 })
+      .where(and(eq(schema.tasks.user_id, userId), eq(schema.tasks.sprint, 1)));
   }
 
-  function archiveDone(userId: string): number {
-    const result = archiveDoneStmt.run(userId);
-    return result.changes;
+  async function archiveDone(userId: string): Promise<number> {
+    const rows = await db.update(schema.tasks)
+      .set({ archived: 1, updated_at: sql`${nowIso()}::timestamp` })
+      .where(and(
+        eq(schema.tasks.user_id, userId),
+        eq(schema.tasks.status, "done"),
+        eq(schema.tasks.archived, 0),
+      ))
+      .returning();
+    return rows.length;
   }
 
-  function statusCounts(userId: string): Record<string, number> {
-    const rows = countByStatusStmt.all(userId) as Array<{ status: string; n: number }>;
+  async function statusCounts(userId: string): Promise<Record<string, number>> {
+    const rows = await db.select({
+      status: schema.tasks.status,
+      n: sql<number>`COUNT(*)::int`,
+    }).from(schema.tasks)
+      .where(and(eq(schema.tasks.user_id, userId), eq(schema.tasks.archived, 0)))
+      .groupBy(schema.tasks.status);
+
     const counts: Record<string, number> = {};
     for (const r of rows) {
       counts[r.status] = r.n;
@@ -249,13 +196,21 @@ export function createTaskStore(dbPath: string) {
     return counts;
   }
 
-  function upcomingDeadlines(userId: string): TaskRow[] {
-    return upcomingDeadlinesStmt.all(userId) as TaskRow[];
+  async function upcomingDeadlines(userId: string): Promise<TaskRow[]> {
+    const rows = await db.select().from(schema.tasks)
+      .where(and(
+        eq(schema.tasks.user_id, userId),
+        sql`${schema.tasks.deadline} IS NOT NULL`,
+        sql`${schema.tasks.deadline} >= ${nowIso()}::timestamp`,
+        eq(schema.tasks.archived, 0),
+        sql`${schema.tasks.status} != 'done'`,
+      ))
+      .orderBy(schema.tasks.deadline)
+      .limit(5);
+    return (rows as unknown as TaskRow[]).map(decodeRow);
   }
 
-  function close(): void {
-    db.close();
-  }
+  function close(): void {}
 
   return {
     create,

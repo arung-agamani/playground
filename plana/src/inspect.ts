@@ -1,66 +1,66 @@
-import { Database } from "bun:sqlite";
-import { join } from "node:path";
+import { eq, sql } from "drizzle-orm";
+import { loadConfig } from "./config";
+import { createDb, closeDb } from "./db";
+import * as schema from "./database";
+import { decrypt } from "./database/crypto";
 
-interface MessageRow {
-  id: number;
-  conversation_id: string;
-  role: string;
-  content: string | null;
-  tool_calls: string | null;
-  tool_call_id: string | null;
-  created_at: string;
-}
+const appConfig = loadConfig();
 
-const dbPath = join(import.meta.dir, "..", "data", "plana.db");
-const db = new Database(dbPath);
+const db = createDb(appConfig.databaseUrl!);
 
 const args = process.argv.slice(2);
 const command = args[0];
 const arg1 = args[1];
 
-const SECTION = "─".repeat(60);
+const SECTION = "\u2500".repeat(60);
 
-switch (command) {
-  case "db":
-    showDbOverview();
-    break;
-  case "reminders":
-  case "rem":
-    showReminders(arg1);
-    break;
-  case "show":
-    if (arg1) showConversation(arg1);
-    else showUsage();
-    break;
-  case "clean":
-    if (arg1) cleanConversation(arg1);
-    else showUsage();
-    break;
-  case "list":
-    listConversations();
-    break;
-  default:
-    listConversations();
-    break;
+main()
+  .catch(console.error)
+  .finally(() => closeDb());
+
+async function main() {
+  switch (command) {
+    case "db":
+      await showDbOverview();
+      break;
+    case "reminders":
+    case "rem":
+      await showReminders(arg1);
+      break;
+    case "show":
+      if (arg1) await showConversation(arg1);
+      else showUsage();
+      break;
+    case "clean":
+      if (arg1) await cleanConversation(arg1);
+      else showUsage();
+      break;
+    case "list":
+      await listConversations();
+      break;
+    default:
+      await listConversations();
+      break;
+  }
 }
 
-// ── DB Overview ──────────────────────────────────────────
-
-function showDbOverview() {
-  const tables = db
-    .query(
-      `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`,
-    )
-    .all() as Array<{ name: string }>;
+async function showDbOverview() {
+  const tables = [
+    { name: "conversations", rel: schema.conversations },
+    { name: "messages", rel: schema.messages },
+    { name: "memories", rel: schema.memories },
+    { name: "pinned_facts", rel: schema.pinnedFacts },
+    { name: "lore_entries", rel: schema.loreEntries },
+    { name: "reminders", rel: schema.reminders },
+    { name: "tasks", rel: schema.tasks },
+  ];
 
   console.log("Database Overview");
   console.log(SECTION);
 
   for (const t of tables) {
-    const count = db
-      .query(`SELECT COUNT(*) as n FROM "${t.name}"`)
-      .get() as { n: number };
-    console.log(`  ${t.name.padEnd(20)} ${count.n} rows`);
+    const rows = await db.select({ n: sql`COUNT(*)::int` }).from(t.rel);
+    console.log(`  ${t.name.padEnd(20)} ${(rows[0] as unknown as { n: number })?.n ?? 0} rows`);
   }
 
   console.log();
@@ -68,40 +68,33 @@ function showDbOverview() {
   console.log(SECTION);
 
   for (const t of tables) {
-    const cols = db
-      .query(`PRAGMA table_info("${t.name}")`)
-      .all() as Array<{
-      cid: number;
-      name: string;
-      type: string;
-      notnull: number;
-      dflt_value: string | null;
-      pk: number;
+    const res = await db.execute(
+      `SELECT column_name, data_type, is_nullable, column_default
+       FROM information_schema.columns
+       WHERE table_name = '${t.name}'
+       ORDER BY ordinal_position`,
+    );
+    const cols = res as unknown as Array<{
+      column_name: string;
+      data_type: string;
+      is_nullable: string;
+      column_default: string | null;
     }>;
     console.log(`  ${t.name}:`);
     for (const c of cols) {
       const flags: string[] = [];
-      if (c.pk) flags.push("PK");
-      if (c.notnull) flags.push("NOT NULL");
-      if (c.dflt_value) flags.push(`DEFAULT ${c.dflt_value}`);
+      if (c.is_nullable === "NO") flags.push("NOT NULL");
+      if (c.column_default) flags.push(`DEFAULT ${c.column_default}`);
       const flagStr = flags.length > 0 ? ` [${flags.join(", ")}]` : "";
       console.log(
-        `    ${c.name.padEnd(18)} ${(c.type || "—").padEnd(12)}${flagStr}`,
+        `    ${c.column_name.padEnd(18)} ${(c.data_type || "\u2014").padEnd(12)}${flagStr}`,
       );
     }
     console.log();
   }
-
-  const dbSize = db.query("SELECT page_count * page_size AS size FROM pragma_page_count(), pragma_page_size()").get() as { size: number };
-  if (dbSize) {
-    const kb = (dbSize.size / 1024).toFixed(1);
-    console.log(`DB file size: ${kb} KB`);
-  }
 }
 
-// ── Reminders ────────────────────────────────────────────
-
-function showReminders(idFilter?: string) {
+async function showReminders(idFilter?: string) {
   let reminders: Array<{
     id: number;
     channel_id: string;
@@ -122,16 +115,13 @@ function showReminders(idFilter?: string) {
       console.log(`Invalid reminder ID: ${idFilter}`);
       return;
     }
-    const r = db
-      .query(`SELECT * FROM reminders WHERE id = ?`)
-      .get(id) as typeof reminders extends Array<infer T> ? T : never;
-    reminders = r ? [r] : [];
+    const rows = await db.select().from(schema.reminders)
+      .where(eq(schema.reminders.id, id)).limit(1);
+    reminders = rows as unknown as typeof reminders;
   } else {
-    reminders = db
-      .query(
-        `SELECT * FROM reminders ORDER BY status, due_at ASC`,
-      )
-      .all() as typeof reminders;
+    const rows = await db.select().from(schema.reminders)
+      .orderBy(schema.reminders.status, schema.reminders.due_at);
+    reminders = rows as unknown as typeof reminders;
   }
 
   if (reminders.length === 0) {
@@ -153,14 +143,14 @@ function showReminders(idFilter?: string) {
 
   for (const r of reminders) {
     const statusIcon =
-      r.status === "active" ? "●" : r.status === "completed" ? "✓" : "✗";
+      r.status === "active" ? "\u25CF" : r.status === "completed" ? "\u2713" : "\u2717";
     const typeLabel = r.recurrence
       ? `${r.type}(${r.recurrence})`
       : r.type;
     console.log(
       `  ${statusIcon} [#${String(r.id).padStart(2)}] ${r.status.padEnd(9)} ${typeLabel.padEnd(18)} due: ${r.due_at}`,
     );
-    console.log(`      msg: "${r.message}"`);
+    console.log(`      msg: "${decrypt(r.message) ?? r.message}"`);
     console.log(
       `      channel: ${shortId(r.channel_id)}  user: ${shortId(r.user_id)}  action: ${r.action_type}`,
     );
@@ -171,44 +161,54 @@ function showReminders(idFilter?: string) {
   }
 }
 
-// ── Conversations ────────────────────────────────────────
+async function listConversations() {
+  const rows = await db.execute(
+    `SELECT c.id, c.updated_at, COUNT(m.id) as msg_count
+     FROM conversations c
+     LEFT JOIN messages m ON m.conversation_id = c.id
+     GROUP BY c.id
+     ORDER BY c.updated_at DESC`,
+  );
 
-function listConversations() {
-  const rows = db
-    .query(
-      `SELECT c.id, c.updated_at, COUNT(m.id) as msg_count
-       FROM conversations c
-       LEFT JOIN messages m ON m.conversation_id = c.id
-       GROUP BY c.id
-       ORDER BY c.updated_at DESC`,
-    )
-    .all() as Array<{ id: string; updated_at: string; msg_count: number }>;
+  const convos = rows as unknown as Array<{
+    id: string;
+    updated_at: string;
+    msg_count: number;
+  }>;
 
-  if (rows.length === 0) {
+  if (convos.length === 0) {
     console.log("No conversations found.");
     return;
   }
 
   console.log("Conversations:");
   console.log(SECTION);
-  for (const row of rows) {
+  for (const row of convos) {
     console.log(
       `  ${row.id}  (${row.msg_count} messages, last: ${row.updated_at})`,
     );
   }
 
   console.log();
-  showDbOverview();
+  await showDbOverview();
 }
 
-function showConversation(convoId: string) {
-  const messages = db
-    .query(
-      `SELECT * FROM messages WHERE conversation_id = ? ORDER BY id ASC`,
-    )
-    .all(convoId) as MessageRow[];
+async function showConversation(convoId: string) {
+  const messages = await db.select()
+    .from(schema.messages)
+    .where(eq(schema.messages.conversation_id, convoId))
+    .orderBy(schema.messages.id);
 
-  if (messages.length === 0) {
+  const rows = messages as unknown as Array<{
+    id: number;
+    role: string;
+    content: string | null;
+    tool_calls: string | null;
+    tool_call_id: string | null;
+    created_at: string;
+  }>;
+
+  if (rows.length === 0) {
     console.log(`No messages found for ${convoId}`);
     return;
   }
@@ -217,24 +217,26 @@ function showConversation(convoId: string) {
   let corrupted = 0;
 
   console.log(`Conversation: ${convoId}`);
-  console.log(`Messages: ${messages.length}`);
+  console.log(`Messages: ${rows.length}`);
   console.log(SECTION);
 
-  for (const msg of messages) {
-    const contentLen = msg.content?.length ?? 0;
+  for (const msg of rows) {
+    const plain = decrypt(msg.content);
+    const plainTc = decrypt(msg.tool_calls);
+    const contentLen = plain?.length ?? 0;
     totalChars += contentLen;
-    if (msg.tool_calls) totalChars += msg.tool_calls.length;
+    if (plainTc) totalChars += plainTc.length;
 
-    const contentPreview = msg.content
-      ? msg.content.length > 100
-        ? msg.content.slice(0, 100) + "…"
-        : msg.content
+    const contentPreview = plain
+      ? plain.length > 100
+        ? plain.slice(0, 100) + "\u2026"
+        : plain
       : "null";
 
     const flags: string[] = [];
-    if (msg.tool_calls) {
+    if (plainTc) {
       try {
-        const parsed = JSON.parse(msg.tool_calls);
+        const parsed = JSON.parse(plainTc);
         if (!Array.isArray(parsed)) {
           flags.push("CORRUPTED");
           corrupted++;
@@ -243,13 +245,13 @@ function showConversation(convoId: string) {
         flags.push("BROKEN_JSON");
         corrupted++;
       }
-      flags.push(`tc:[${truncate(msg.tool_calls, 50)}]`);
+      flags.push(`tc:[${truncate(plainTc, 50)}]`);
     }
     if (msg.tool_call_id) {
       flags.push(`tid:${msg.tool_call_id}`);
     }
 
-    const charCount = String(msg.content?.length ?? 0) + "c";
+    const charCount = String(plain?.length ?? 0) + "c";
     const flagStr = flags.length > 0 ? ` ${flags.join(" ")}` : "";
 
     console.log(
@@ -270,17 +272,9 @@ function showConversation(convoId: string) {
   }
 }
 
-function cleanConversation(convoId: string) {
+async function cleanConversation(_convoId: string) {
   console.log("Cleaning conversation messages is currently disabled for safety reasons.");
-  // const result = db
-  //   .query(`DELETE FROM messages WHERE conversation_id = ?`)
-  //   .run(convoId);
-  // console.log(
-  //   `Cleared ${result.changes} messages from ${convoId}. Run /reset in Discord to fully reset.`,
-  // );
 }
-
-// ── Helpers ──────────────────────────────────────────────
 
 function showUsage() {
   console.log("Usage:");
@@ -294,11 +288,9 @@ function showUsage() {
 
 function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
-  return text.slice(0, maxLen) + "…";
+  return text.slice(0, maxLen) + "\u2026";
 }
 
 function shortId(id: string): string {
   return id.slice(-8);
 }
-
-db.close();

@@ -1,6 +1,7 @@
 import { config } from "dotenv";
 import { join } from "node:path";
 import { loadConfig, loadPersonaFromConfig } from "./config";
+import { createDb, closeDb } from "./db";
 import { createStore } from "./conversation/store";
 import { createReminderStore } from "./reminders/store";
 import { createTaskStore } from "./tasks/store";
@@ -17,16 +18,16 @@ const appConfig = loadConfig();
 
 const persona = loadPersonaFromConfig();
 
-console.log(`Loaded persona: ${persona.meta.display_name} v${persona.meta.version}`);
+const db = createDb(appConfig.databaseUrl!);
 
-const dbPath = join(import.meta.dir, "..", "data", "plana.db");
-const store = createStore(dbPath);
-const reminderStore = createReminderStore(dbPath);
-const taskStore = createTaskStore(dbPath);
-const memoryStore = createMemoryStore(dbPath);
-const loreStore = createLoreStore(dbPath);
+const store = createStore(db);
+const reminderStore = createReminderStore(db);
+const taskStore = createTaskStore(db);
+const memoryStore = createMemoryStore(db);
+const loreStore = createLoreStore(db);
 
-const thresholdState = createThresholds(store.getMessages(appConfig.guildId, "0").length || 0);
+const initialMessages = await store.getMessages(appConfig.guildId, "0");
+const thresholdState = createThresholds(initialMessages.length || 0);
 
 const toolRegistry = createToolRegistry(
   reminderStore,
@@ -65,9 +66,9 @@ const client = await startDiscord(
   },
 );
 
-seedGreetingReminder(reminderStore, appConfig);
+await seedGreetingReminder(reminderStore, appConfig);
 
-const engine = startReminderEngine({
+const engine = await startReminderEngine({
   client,
   reminderStore,
   convStore: store,
@@ -82,33 +83,25 @@ const engine = startReminderEngine({
   },
 });
 
-process.on("SIGINT", () => {
+process.on("SIGINT", async () => {
   engine.stop();
-  loreStore.close();
-  memoryStore.close();
-  taskStore.close();
-  reminderStore.close();
-  store.close();
+  await closeDb();
   process.exit(0);
 });
 
-process.on("SIGTERM", () => {
+process.on("SIGTERM", async () => {
   engine.stop();
-  loreStore.close();
-  memoryStore.close();
-  taskStore.close();
-  reminderStore.close();
-  store.close();
+  await closeDb();
   process.exit(0);
 });
 
-function seedGreetingReminder(
+async function seedGreetingReminder(
   store: ReturnType<typeof createReminderStore>,
   config: ReturnType<typeof loadConfig>,
 ) {
   if (!config.greetingTime || !config.greetingChannelId) return;
 
-  const active = store.getActive(config.greetingChannelId);
+  const active = await store.getActive(config.greetingChannelId);
   const exists = active.some((r) => r.action_type === "greeting");
   if (exists) return;
 
@@ -122,7 +115,7 @@ function seedGreetingReminder(
   const due = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h!, m!, 0, 0);
   if (due <= now) due.setDate(due.getDate() + 1);
 
-  store.create({
+  await store.create({
     guildId: config.guildId,
     channelId: config.greetingChannelId,
     userId: client?.user?.id ?? "0",
@@ -133,9 +126,8 @@ function seedGreetingReminder(
     recurrence: "daily",
   });
 
-  // Nudge: follows 30 min after greeting
   const nudgeDue = new Date(due.getTime() + 30 * 60_000);
-  store.create({
+  await store.create({
     guildId: config.guildId,
     channelId: config.greetingChannelId,
     userId: client?.user?.id ?? "0",

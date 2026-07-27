@@ -9,16 +9,16 @@ interface ScoredLore extends LoreRow {
   rank: number;
 }
 
-export function searchAll(
+export async function searchAll(
   memStore: MemoryStore,
   loreStore: LoreStore,
   query: string,
-): { memories: ScoredMemory[]; facts: string[]; lore: ScoredLore[] } {
-  const rawMemories = memStore.searchMemories(query);
+): Promise<{ memories: ScoredMemory[]; facts: string[]; lore: ScoredLore[] }> {
+  const rawMemories = await memStore.searchMemories(query);
   const memories = rawMemories as ScoredMemory[];
-  const rawFacts = memStore.searchFacts(query);
+  const rawFacts = await memStore.searchFacts(query);
   const facts = rawFacts.map((f) => f.fact);
-  const lore = loreStore.search(query) as ScoredLore[];
+  const lore = await loreStore.search(query) as ScoredLore[];
 
   return { memories, facts, lore };
 }
@@ -77,7 +77,6 @@ export async function rerankWithLlm(
       return parsed.join("\n");
     }
   } catch {
-    // fall through
   }
 
   return text;

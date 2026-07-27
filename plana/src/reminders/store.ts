@@ -1,7 +1,11 @@
-import { Database } from "bun:sqlite";
+import { eq, and, sql } from "drizzle-orm";
+import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
+import * as schema from "../database";
+import { nowIso } from "../database/time";
+import { encrypt, decrypt } from "../database/crypto";
+import { reminderCreateSchema, parseOrError } from "../database/validation";
 
 export type ActionType = "remind" | "greeting" | "nudge";
-
 export type ReminderStatus = "active" | "completed" | "cancelled";
 
 export interface ReminderRow {
@@ -17,223 +21,139 @@ export interface ReminderRow {
   due_at: string;
   recurrence: string | null;
   created_at: string;
+  updated_at: string;
   completed_at: string | null;
 }
 
-export function createReminderStore(dbPath: string) {
-  const db = new Database(dbPath);
-
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA foreign_keys = ON");
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS reminders (
-      id              INTEGER PRIMARY KEY AUTOINCREMENT,
-      guild_id        TEXT NOT NULL,
-      channel_id      TEXT NOT NULL,
-      user_id         TEXT NOT NULL,
-      message         TEXT NOT NULL,
-      action_type     TEXT NOT NULL DEFAULT 'remind'
-                      CHECK(action_type IN ('remind', 'greeting', 'nudge')),
-      action_config   TEXT NOT NULL DEFAULT '{}',
-      type            TEXT NOT NULL CHECK(type IN ('once', 'recurring')),
-      status          TEXT NOT NULL DEFAULT 'active'
-                      CHECK(status IN ('active', 'completed', 'cancelled')),
-      due_at          TEXT NOT NULL,
-      recurrence      TEXT,
-      created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
-      completed_at    TEXT
-    )
-  `);
-
-  const hasUpdatedAt = db
-    .query("PRAGMA table_info(reminders)")
-    .all()
-    .some((r: unknown) => (r as Record<string, string>).name === "updated_at");
-
-  if (!hasUpdatedAt) {
-    db.exec("DROP TABLE IF EXISTS reminders");
-    db.exec(`
-      CREATE TABLE reminders (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        guild_id        TEXT NOT NULL,
-        channel_id      TEXT NOT NULL,
-        user_id         TEXT NOT NULL,
-        message         TEXT NOT NULL,
-        action_type     TEXT NOT NULL DEFAULT 'remind'
-                        CHECK(action_type IN ('remind', 'greeting', 'nudge')),
-        action_config   TEXT NOT NULL DEFAULT '{}',
-        type            TEXT NOT NULL CHECK(type IN ('once', 'recurring')),
-        status          TEXT NOT NULL DEFAULT 'active'
-                        CHECK(status IN ('active', 'completed', 'cancelled')),
-        due_at          TEXT NOT NULL,
-        recurrence      TEXT,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        completed_at    TEXT
-      )
-    `);
+export function createReminderStore(db: PostgresJsDatabase<typeof schema>) {
+  function decodeRow(row: Record<string, unknown>): ReminderRow {
+    return {
+      id: row.id as number,
+      guild_id: row.guild_id as string,
+      channel_id: row.channel_id as string,
+      user_id: row.user_id as string,
+      message: decrypt(row.message as string) ?? (row.message as string),
+      action_type: row.action_type as ActionType,
+      action_config: row.action_config as string,
+      type: row.type as "once" | "recurring",
+      status: row.status as ReminderStatus,
+      due_at: row.due_at instanceof Date ? row.due_at.toISOString() : (row.due_at as string),
+      recurrence: row.recurrence as string | null,
+      created_at: row.created_at instanceof Date ? row.created_at.toISOString() : (row.created_at as string),
+      updated_at: row.updated_at instanceof Date ? row.updated_at.toISOString() : (row.updated_at as string),
+      completed_at: row.completed_at instanceof Date ? row.completed_at.toISOString() : (row.completed_at as string | null),
+    };
   }
 
-  const constraintSql = db
-    .query("SELECT sql FROM sqlite_master WHERE type='table' AND name='reminders'")
-    .get() as { sql: string } | undefined;
+  async function create(params: {
+    guildId: string;
+    channelId: string;
+    userId: string;
+    message: string;
+    actionType?: ActionType;
+    actionConfig?: Record<string, unknown>;
+    type: "once" | "recurring";
+    dueAt: string;
+    recurrence?: string | null;
+  }): Promise<ReminderRow> {
+    const parsed = parseOrError(reminderCreateSchema, params, "reminder.create");
+    if (!parsed.ok) throw new Error(parsed.error);
 
-  if (constraintSql && !constraintSql.sql.includes("'greeting'")) {
-    db.exec("BEGIN");
-    db.exec("ALTER TABLE reminders RENAME TO reminders_old");
-    db.exec(`
-      CREATE TABLE reminders (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        guild_id        TEXT NOT NULL,
-        channel_id      TEXT NOT NULL,
-        user_id         TEXT NOT NULL,
-        message         TEXT NOT NULL,
-        action_type     TEXT NOT NULL DEFAULT 'remind'
-                        CHECK(action_type IN ('remind', 'greeting', 'nudge')),
-        action_config   TEXT NOT NULL DEFAULT '{}',
-        type            TEXT NOT NULL CHECK(type IN ('once', 'recurring')),
-        status          TEXT NOT NULL DEFAULT 'active'
-                        CHECK(status IN ('active', 'completed', 'cancelled')),
-        due_at          TEXT NOT NULL,
-        recurrence      TEXT,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        completed_at    TEXT
-      )
-    `);
-    db.exec("INSERT INTO reminders SELECT * FROM reminders_old");
-    db.exec("DROP TABLE reminders_old");
-    db.exec("COMMIT");
-    console.log("Migrated reminders table: added greeting/nudge action types");
+    const ts = nowIso();
+    const [row] = await db.insert(schema.reminders).values({
+      guild_id: parsed.data.guildId,
+      channel_id: parsed.data.channelId,
+      user_id: parsed.data.userId,
+      message: encrypt(parsed.data.message) ?? parsed.data.message,
+      action_type: parsed.data.actionType ?? "remind",
+      action_config: parsed.data.actionConfig
+        ? JSON.stringify(parsed.data.actionConfig)
+        : "{}",
+      type: parsed.data.type,
+      due_at: sql`${parsed.data.dueAt}::timestamp`,
+      recurrence: parsed.data.recurrence ?? null,
+      created_at: sql`${ts}::timestamp`,
+      updated_at: sql`${ts}::timestamp`,
+    }).returning();
+    return decodeRow(row as unknown as ReminderRow);
   }
 
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_reminders_due
-    ON reminders(status, due_at)
-  `);
+  async function getDue(): Promise<ReminderRow[]> {
+    const ts = nowIso();
+    const rows = await db.select().from(schema.reminders)
+      .where(and(
+        eq(schema.reminders.status, "active"),
+        sql`${schema.reminders.due_at} <= ${ts}::timestamp`,
+      ))
+      .orderBy(schema.reminders.due_at);
+    return (rows as unknown as ReminderRow[]).map(decodeRow);
+  }
 
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_reminders_channel
-    ON reminders(channel_id, status)
-  `);
+  async function getActive(channelId: string): Promise<ReminderRow[]> {
+    const rows = await db.select().from(schema.reminders)
+      .where(and(
+        eq(schema.reminders.channel_id, channelId),
+        eq(schema.reminders.status, "active"),
+      ))
+      .orderBy(schema.reminders.due_at);
+    return (rows as unknown as ReminderRow[]).map(decodeRow);
+  }
 
-  const createStmt = db.prepare(`
-    INSERT INTO reminders (guild_id, channel_id, user_id, message, action_type, action_config, type, due_at, recurrence)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+  async function getById(id: number): Promise<ReminderRow | null> {
+    const [row] = await db.select().from(schema.reminders)
+      .where(eq(schema.reminders.id, id)).limit(1);
+    return row ? decodeRow(row as unknown as ReminderRow) : null;
+  }
 
-  const getDueStmt = db.prepare(`
-    SELECT * FROM reminders
-    WHERE status = 'active' AND datetime(due_at) <= datetime('now')
-    ORDER BY due_at ASC
-  `);
+  async function update(
+    id: number,
+    updates: { message?: string; dueAt?: string; recurrence?: string | null },
+  ): Promise<boolean> {
+    const updateData: Record<string, unknown> = { updated_at: sql`${nowIso()}::timestamp` };
+    if (updates.message !== undefined) updateData.message = encrypt(updates.message) ?? updates.message;
+    if (updates.dueAt !== undefined) updateData.due_at = sql`${updates.dueAt}::timestamp`;
+    if (updates.recurrence !== undefined) updateData.recurrence = updates.recurrence;
 
-  const getActiveStmt = db.prepare(`
-    SELECT * FROM reminders
-    WHERE channel_id = ? AND status = 'active'
-    ORDER BY due_at ASC
-  `);
+    const [row] = await db.update(schema.reminders)
+      .set(updateData)
+      .where(and(eq(schema.reminders.id, id), eq(schema.reminders.status, "active")))
+      .returning();
+    return !!row;
+  }
 
-  const getByIdStmt = db.prepare(`
-    SELECT * FROM reminders WHERE id = ?
-  `);
+  async function complete(id: number): Promise<void> {
+    const ts = nowIso();
+    await db.update(schema.reminders)
+      .set({ status: "completed", completed_at: sql`${ts}::timestamp`, updated_at: sql`${ts}::timestamp` })
+      .where(eq(schema.reminders.id, id));
+  }
 
-  const updateStmt = db.prepare(`
-    UPDATE reminders
-    SET message = COALESCE(?, message),
-        due_at = COALESCE(?, due_at),
-        recurrence = COALESCE(?, recurrence),
-        updated_at = datetime('now')
-    WHERE id = ? AND status = 'active'
-  `);
+  async function cancel(id: number): Promise<boolean> {
+    const [row] = await db.update(schema.reminders)
+      .set({ status: "cancelled", updated_at: sql`${nowIso()}::timestamp` })
+      .where(and(eq(schema.reminders.id, id), eq(schema.reminders.status, "active")))
+      .returning();
+    return !!row;
+  }
 
-  const completeStmt = db.prepare(`
-    UPDATE reminders
-    SET status = 'completed', completed_at = datetime('now')
-    WHERE id = ?
-  `);
+  async function reschedule(id: number, nextDueAt: string): Promise<void> {
+    await db.update(schema.reminders)
+      .set({ due_at: sql`${nextDueAt}::timestamp`, updated_at: sql`${nowIso()}::timestamp` })
+      .where(eq(schema.reminders.id, id));
+  }
 
-  const cancelStmt = db.prepare(`
-    UPDATE reminders
-    SET status = 'cancelled'
-    WHERE id = ? AND status = 'active'
-  `);
-
-  const rescheduleStmt = db.prepare(`
-    UPDATE reminders
-    SET due_at = ?
-    WHERE id = ?
-  `);
+  function close(): void {}
 
   return {
-    create(params: {
-      guildId: string;
-      channelId: string;
-      userId: string;
-      message: string;
-      actionType?: ActionType;
-      actionConfig?: Record<string, unknown>;
-      type: "once" | "recurring";
-      dueAt: string;
-      recurrence?: string | null;
-    }): ReminderRow {
-      const result = createStmt.run(
-        params.guildId,
-        params.channelId,
-        params.userId,
-        params.message,
-        params.actionType ?? "remind",
-        params.actionConfig ? JSON.stringify(params.actionConfig) : "{}",
-        params.type,
-        params.dueAt,
-        params.recurrence ?? null,
-      );
-      return getByIdStmt.get(result.lastInsertRowid) as ReminderRow;
-    },
-
-    getDue(): ReminderRow[] {
-      return getDueStmt.all() as ReminderRow[];
-    },
-
-    getActive(channelId: string): ReminderRow[] {
-      return getActiveStmt.all(channelId) as ReminderRow[];
-    },
-
-    getById(id: number): ReminderRow | null {
-      return (getByIdStmt.get(id) as ReminderRow) ?? null;
-    },
-
-    update(
-      id: number,
-      updates: { message?: string; dueAt?: string; recurrence?: string | null },
-    ): boolean {
-      const result = updateStmt.run(
-        updates.message ?? null,
-        updates.dueAt ?? null,
-        updates.recurrence ?? null,
-        id,
-      );
-      return result.changes > 0;
-    },
-
-    complete(id: number): void {
-      completeStmt.run(id);
-    },
-
-    cancel(id: number): boolean {
-      const result = cancelStmt.run(id);
-      return result.changes > 0;
-    },
-
-    reschedule(id: number, nextDueAt: string): void {
-      rescheduleStmt.run(nextDueAt, id);
-    },
-
-    close(): void {
-      db.close();
-    },
+    create,
+    getDue,
+    getActive,
+    getById,
+    update,
+    complete,
+    cancel,
+    reschedule,
+    close,
   };
 }
 

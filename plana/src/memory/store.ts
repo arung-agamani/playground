@@ -1,4 +1,13 @@
-import { Database } from "bun:sqlite";
+import { eq, sql, and, or, desc } from "drizzle-orm";
+import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
+import * as schema from "../database";
+import { nowIso } from "../database/time";
+import { encrypt, decrypt } from "../database/crypto";
+import {
+  memoryUpsertSchema,
+  factInsertSchema,
+  parseOrError,
+} from "../database/validation";
 
 export type MemoryTier = "lifetime" | "monthly" | "weekly" | "daily";
 
@@ -21,190 +30,106 @@ export interface FactRow {
   updated_at: string;
 }
 
-export function createMemoryStore(dbPath: string) {
-  const db = new Database(dbPath);
+function rowToStr(d: Date | string | null | undefined): string {
+  if (!d) return "";
+  if (typeof d === "string") return d;
+  return d.toISOString();
+}
 
-  db.exec("PRAGMA journal_mode = WAL");
+function tsToStr(d: Date | string | null | undefined): string {
+  if (!d) return "";
+  if (typeof d === "string") return d;
+  return d.toISOString();
+}
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS memories (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      tier       TEXT NOT NULL UNIQUE CHECK(tier IN ('lifetime','monthly','weekly','daily')),
-      content    TEXT NOT NULL DEFAULT '',
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-  `);
+export function createMemoryStore(db: PostgresJsDatabase<typeof schema>) {
+  function decodeMemory(row: MemoryRow): MemoryRow {
+    return { ...row, content: decrypt(row.content) ?? row.content };
+  }
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS pinned_facts (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      fact       TEXT NOT NULL,
-      source     TEXT,
-      confidence REAL NOT NULL DEFAULT 0.5,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-  `);
+  function decodeFact(row: FactRow): FactRow {
+    return { ...row, fact: decrypt(row.fact) ?? row.fact };
+  }
 
-  // ── Migration: add nature, freshness, revision, updated_at ────
+  function toMemoryRow(r: Record<string, unknown>): MemoryRow {
+    return {
+      id: r.id as number,
+      tier: r.tier as MemoryTier,
+      content: r.content as string,
+      updated_at: tsToStr(r.updated_at as Date | string),
+    };
+  }
 
-  const cols = db.query("PRAGMA table_info(pinned_facts)").all() as Array<{ name: string }>;
-  const hasFreshness = cols.some((c) => c.name === "freshness");
+  function toFactRow(r: Record<string, unknown>): FactRow {
+    return {
+      id: r.id as number,
+      fact: r.fact as string,
+      source: r.source as string | null,
+      confidence: r.confidence as number,
+      nature: r.nature as "persistent" | "temporal",
+      freshness: r.freshness as number,
+      revision: r.revision as number,
+      created_at: tsToStr(r.created_at as Date | string),
+      updated_at: tsToStr(r.updated_at as Date | string),
+    };
+  }
 
-  if (!hasFreshness) {
-    db.exec("BEGIN");
-    db.exec("ALTER TABLE pinned_facts RENAME TO pinned_facts_old");
-    db.exec(`
-      CREATE TABLE pinned_facts (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        fact       TEXT NOT NULL,
-        source     TEXT,
-        confidence REAL NOT NULL DEFAULT 0.5,
-        nature     TEXT NOT NULL DEFAULT 'temporal'
-                   CHECK(nature IN ('persistent', 'temporal')),
-        freshness  REAL NOT NULL DEFAULT 0.5,
-        revision   INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  async function upsertMemory(tier: MemoryTier, content: string): Promise<void> {
+    const parsed = parseOrError(
+      memoryUpsertSchema,
+      { tier, content },
+      "upsertMemory",
+    );
+    if (!parsed.ok) throw new Error(parsed.error);
+
+    const ts = nowIso();
+    await db.insert(schema.memories).values({
+      tier: parsed.data.tier,
+      content: encrypt(parsed.data.content) ?? parsed.data.content,
+      updated_at: sql`${ts}::timestamp`,
+    }).onConflictDoUpdate({
+      target: schema.memories.tier,
+      set: {
+        content: encrypt(parsed.data.content) ?? parsed.data.content,
+        updated_at: sql`${ts}::timestamp`,
+      },
+    });
+  }
+
+  async function getMemory(tier: MemoryTier): Promise<string> {
+    const [row] = await db.select().from(schema.memories)
+      .where(eq(schema.memories.tier, tier)).limit(1);
+    if (!row) return "";
+    const r = row as unknown as MemoryRow;
+    return decrypt(r.content) ?? r.content;
+  }
+
+  async function getAllMemories(): Promise<MemoryRow[]> {
+    const rows = await db.select().from(schema.memories)
+      .orderBy(schema.memories.tier);
+    return (rows as unknown as MemoryRow[]).map(decodeMemory);
+  }
+
+  async function buildMemoryBlock(): Promise<string> {
+    const rows = await getAllMemories();
+    const recentFacts = await db.select({
+      fact: schema.pinnedFacts.fact,
+    }).from(schema.pinnedFacts)
+      .where(or(
+        eq(schema.pinnedFacts.nature, "persistent"),
+        and(
+          eq(schema.pinnedFacts.nature, "temporal"),
+          sql`${schema.pinnedFacts.freshness} > 0.6`,
+        ),
+      ))
+      .orderBy(
+        sql`CASE WHEN ${schema.pinnedFacts.nature} = 'persistent' THEN 0 ELSE 1 END`,
+        desc(schema.pinnedFacts.freshness),
+        desc(schema.pinnedFacts.created_at),
       )
-    `);
-    db.exec(`
-      INSERT INTO pinned_facts (id, fact, source, confidence, nature, freshness, revision, created_at, updated_at)
-      SELECT id, fact, source, confidence, 'temporal', 0.5, 1, created_at, datetime('now')
-      FROM pinned_facts_old
-    `);
-    db.exec("DROP TABLE pinned_facts_old");
-    db.exec("DROP TABLE IF EXISTS facts_fts");
-    db.exec(`
-      CREATE VIRTUAL TABLE facts_fts USING fts5(
-        fact,
-        content=pinned_facts,
-        content_rowid=id
-      )
-    `);
-    db.exec("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')");
-    db.exec("COMMIT");
-    console.log("Migrated pinned_facts: added nature/freshness/revision, default temporal 0.5");
-  }
+      .limit(100);
 
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-      tier,
-      content,
-      content=memories,
-      content_rowid=id
-    )
-  `);
-
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
-      fact,
-      content=pinned_facts,
-      content_rowid=id
-    )
-  `);
-
-  const upsertMemoryStmt = db.prepare(`
-    INSERT INTO memories (tier, content, updated_at)
-    VALUES (?, ?, datetime('now'))
-    ON CONFLICT(tier) DO UPDATE SET
-      content = excluded.content,
-      updated_at = excluded.updated_at
-  `);
-
-  const getMemoryStmt = db.prepare(`SELECT * FROM memories WHERE tier = ?`);
-  const getAllMemoriesStmt = db.prepare(`SELECT * FROM memories ORDER BY tier`);
-
-  const insertFactStmt = db.prepare(`
-    INSERT INTO pinned_facts (fact, source, confidence, nature, freshness)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-
-  const searchFactDupStmt = db.prepare(`
-    SELECT pinned_facts.id, pinned_facts.fact, pinned_facts.confidence,
-           pinned_facts.nature, pinned_facts.freshness, pinned_facts.revision,
-           bm25(facts_fts) as rank
-    FROM facts_fts
-    JOIN pinned_facts ON pinned_facts.id = facts_fts.rowid
-    WHERE facts_fts MATCH ?
-    ORDER BY rank
-    LIMIT 1
-  `);
-
-  const updateFactStmt = db.prepare(`
-    UPDATE pinned_facts
-    SET fact = ?,
-        confidence = ?,
-        nature = ?,
-        freshness = 1.0,
-        revision = revision + 1,
-        updated_at = datetime('now')
-    WHERE id = ?
-  `);
-
-  const searchMemoriesStmt = db.prepare(`
-    SELECT memories.id, memories.tier, memories.content,
-           bm25(memories_fts) as rank
-    FROM memories_fts
-    JOIN memories ON memories.id = memories_fts.rowid
-    WHERE memories_fts MATCH ?
-    ORDER BY rank
-    LIMIT 5
-  `);
-
-  const searchFactsStmt = db.prepare(`
-    SELECT pinned_facts.id, pinned_facts.fact, pinned_facts.confidence,
-           bm25(facts_fts) as rank
-    FROM facts_fts
-    JOIN pinned_facts ON pinned_facts.id = facts_fts.rowid
-    WHERE facts_fts MATCH ?
-    ORDER BY rank
-    LIMIT 5
-  `);
-
-  const getAllFactsStmt = db.prepare(
-    `SELECT * FROM pinned_facts ORDER BY freshness DESC, confidence DESC, created_at DESC`,
-  );
-
-  const decayFactsStmt = db.prepare(`
-    UPDATE pinned_facts
-    SET freshness = MAX(0, freshness - 0.1),
-        updated_at = datetime('now')
-    WHERE nature = 'temporal' AND freshness > 0
-  `);
-
-  const cleanupFactsStmt = db.prepare(`
-    DELETE FROM pinned_facts WHERE nature = 'temporal' AND freshness <= 0
-  `);
-
-  const recentFactsStmt = db.prepare(`
-    SELECT fact FROM pinned_facts
-    WHERE nature = 'persistent' OR (nature = 'temporal' AND freshness > 0.6)
-    ORDER BY
-      CASE WHEN nature = 'persistent' THEN 0 ELSE 1 END,
-      freshness DESC,
-      created_at DESC
-    LIMIT 100
-  `);
-
-  function upsertMemory(tier: MemoryTier, content: string): void {
-    upsertMemoryStmt.run(tier, content);
-    db.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')");
-  }
-
-  function getMemory(tier: MemoryTier): string {
-    const row = getMemoryStmt.get(tier) as MemoryRow | undefined;
-    return row?.content ?? "";
-  }
-
-  function getAllMemories(): MemoryRow[] {
-    return getAllMemoriesStmt.all() as MemoryRow[];
-  }
-
-  function buildMemoryBlock(): string {
-    const rows = getAllMemories();
-    const recentFacts = recentFactsStmt.all() as Array<{ fact: string }>;
     const parts: string[] = [];
-
     const include: MemoryTier[] = ["daily", "weekly"];
     for (const tier of include) {
       const r = rows.find((r) => r.tier === tier);
@@ -217,79 +142,148 @@ export function createMemoryStore(dbPath: string) {
       parts.push("");
       parts.push("Recent facts about Sensei:");
       for (const f of recentFacts) {
-        parts.push(`- ${f.fact}`);
+        const decrypted = decrypt(f.fact) ?? f.fact;
+        parts.push(`- ${decrypted}`);
       }
     }
 
     return parts.join("\n");
   }
 
-  function insertFact(
+  async function insertFact(
     fact: string,
     options?: {
       source?: string;
       confidence?: number;
       nature?: "persistent" | "temporal";
     },
-  ): { id: number; merged: boolean } {
-    const nature = options?.nature ?? "temporal";
-    const confidence = options?.confidence ?? 0.8;
+  ): Promise<{ id: number; merged: boolean }> {
+    const parsed = parseOrError(
+      factInsertSchema,
+      {
+        fact,
+        source: options?.source,
+        confidence: options?.confidence,
+        nature: options?.nature,
+      },
+      "insertFact",
+    );
+    if (!parsed.ok) throw new Error(parsed.error);
 
-    const ftsQuery = fact.split(/\s+/).map((w) => `"${w}"`).join(" OR ");
-    const existing = searchFactDupStmt.get(ftsQuery) as {
-      id: number;
-      rank: number;
-      fact: string;
-      confidence: number;
-      nature: string;
-      freshness: number;
-      revision: number;
-    } | undefined;
+    const nature = parsed.data.nature ?? "temporal";
+    const confidence = parsed.data.confidence ?? 0.8;
+    const plainFact = parsed.data.fact;
+    const storedFact = encrypt(plainFact) ?? plainFact;
 
-    if (existing && existing.rank < -4) {
-      const newConfidence = Math.max(existing.confidence, confidence);
-      updateFactStmt.run(fact, newConfidence, nature, existing.id);
-      db.exec("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')");
-      return { id: existing.id, merged: true };
+    const existing = await db.execute(sql`
+      SELECT pf.id, pf.fact, pf.confidence, pf.nature, pf.freshness, pf.revision,
+        ts_rank(
+          to_tsvector('english', pf.fact),
+          plainto_tsquery('english', ${plainFact})
+        ) as rank
+      FROM ${schema.pinnedFacts} pf
+      WHERE to_tsvector('english', pf.fact) @@ plainto_tsquery('english', ${plainFact})
+      ORDER BY rank DESC
+      LIMIT 1
+    `) as unknown as Array<{
+      id: number; fact: string; confidence: number;
+      nature: string; freshness: number; revision: number; rank: number;
+    }>;
+
+    if (existing.length > 0 && existing[0]!.rank > 0.3) {
+      const newConfidence = Math.max(existing[0]!.confidence, confidence);
+      await db.update(schema.pinnedFacts)
+        .set({
+          fact: storedFact,
+          confidence: newConfidence,
+          nature,
+          freshness: 1.0,
+          revision: existing[0]!.revision + 1,
+          updated_at: sql`${nowIso()}::timestamp`,
+        })
+        .where(eq(schema.pinnedFacts.id, existing[0]!.id));
+      return { id: existing[0]!.id, merged: true };
     }
 
-    const result = insertFactStmt.run(
-      fact,
-      options?.source ?? null,
+    const ts = nowIso();
+    const [row] = await db.insert(schema.pinnedFacts).values({
+      fact: storedFact,
+      source: parsed.data.source ?? null,
       confidence,
       nature,
-      1.0,
+      freshness: 1.0,
+      revision: 1,
+      created_at: sql`${ts}::timestamp`,
+      updated_at: sql`${ts}::timestamp`,
+    }).returning();
+    return { id: (row as unknown as { id: number }).id, merged: false };
+  }
+
+  async function getAllFacts(): Promise<FactRow[]> {
+    const rows = await db.select().from(schema.pinnedFacts)
+      .orderBy(
+        desc(schema.pinnedFacts.freshness),
+        desc(schema.pinnedFacts.confidence),
+        desc(schema.pinnedFacts.created_at),
+      );
+    return (rows as unknown as FactRow[]).map(decodeFact);
+  }
+
+  async function searchMemories(query: string): Promise<Array<MemoryRow & { rank: number }>> {
+    const rows = await db.execute(sql`
+      SELECT m.id, m.tier, m.content,
+        ts_rank(
+          to_tsvector('english', m.content),
+          plainto_tsquery('english', ${query})
+        ) as rank
+      FROM ${schema.memories} m
+      WHERE to_tsvector('english', m.content) @@ plainto_tsquery('english', ${query})
+      ORDER BY rank DESC
+      LIMIT 5
+    `);
+    return (rows as Array<{ id: number; tier: string; content: string; rank: number }>).map(
+      (r) => ({ ...r, tier: r.tier as MemoryTier, content: decrypt(r.content) ?? r.content }),
     );
-    db.exec("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')");
-    return { id: Number(result.lastInsertRowid), merged: false };
   }
 
-  function getAllFacts(): FactRow[] {
-    return getAllFactsStmt.all() as FactRow[];
+  async function searchFacts(
+    query: string,
+  ): Promise<Array<{ id: number; fact: string; confidence: number; rank: number }>> {
+    const rows = await db.execute(sql`
+      SELECT pf.id, pf.fact, pf.confidence,
+        ts_rank(
+          to_tsvector('english', pf.fact),
+          plainto_tsquery('english', ${query})
+        ) as rank
+      FROM ${schema.pinnedFacts} pf
+      WHERE to_tsvector('english', pf.fact) @@ plainto_tsquery('english', ${query})
+      ORDER BY rank DESC
+      LIMIT 5
+    `);
+    return (rows as Array<{ id: number; fact: string; confidence: number; rank: number }>).map(
+      (r) => ({ ...r, fact: decrypt(r.fact) ?? r.fact }),
+    );
   }
 
-  function searchMemories(query: string): Array<MemoryRow & { rank: number }> {
-    const ftsQuery = query.split(/\s+/).map((w) => `"${w}"`).join(" OR ");
-    return searchMemoriesStmt.all(ftsQuery) as Array<MemoryRow & { rank: number }>;
+  async function decayAndCleanup(): Promise<{ decayed: number; cleaned: number }> {
+    const decayResult = await db.update(schema.pinnedFacts)
+      .set({
+        freshness: sql`GREATEST(0, ${schema.pinnedFacts.freshness} - 0.1)`,
+        updated_at: sql`${nowIso()}::timestamp`,
+      })
+      .where(and(
+        eq(schema.pinnedFacts.nature, "temporal"),
+        sql`${schema.pinnedFacts.freshness} > 0`,
+      ));
+    const cleanedResult = await db.delete(schema.pinnedFacts)
+      .where(and(
+        eq(schema.pinnedFacts.nature, "temporal"),
+        sql`${schema.pinnedFacts.freshness} <= 0`,
+      ));
+    return { decayed: decayResult.length, cleaned: cleanedResult.length };
   }
 
-  function searchFacts(query: string): Array<{ id: number; fact: string; confidence: number; rank: number }> {
-    const ftsQuery = query.split(/\s+/).map((w) => `"${w}"`).join(" OR ");
-    return searchFactsStmt.all(ftsQuery) as Array<{ id: number; fact: string; confidence: number; rank: number }>;
-  }
-
-  function decayAndCleanup(): { decayed: number; cleaned: number } {
-    const decayResult = decayFactsStmt.run();
-    const cleanResult = cleanupFactsStmt.run();
-    if (decayResult.changes > 0 || cleanResult.changes > 0) {
-      db.exec("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')");
-    }
-    return { decayed: decayResult.changes, cleaned: cleanResult.changes };
-  }
-
-  function close(): void {
-    db.close();
-  }
+  function close(): void {}
 
   return {
     upsertMemory,

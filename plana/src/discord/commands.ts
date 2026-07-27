@@ -33,7 +33,7 @@ export function buildCommands(): Collection<string, SlashCommand> {
         .__handlers as Record<string, unknown> | undefined;
 
       if (handlers?.clearConversation) {
-        (handlers.clearConversation as (g: string, c: string) => void)(
+        await (handlers.clearConversation as (g: string, c: string) => Promise<void>)(
           guildId,
           channelId,
         );
@@ -109,7 +109,7 @@ export function buildCommands(): Collection<string, SlashCommand> {
 
       if (subcommand === "show") {
         const result = handlers?.showMemory
-          ? (handlers.showMemory as () => string)()
+          ? await (handlers.showMemory as () => Promise<string>)()
           : "Memory unavailable.";
         await interaction.reply({ content: result, ephemeral: true });
       }

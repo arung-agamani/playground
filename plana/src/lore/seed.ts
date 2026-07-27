@@ -1,8 +1,9 @@
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { loadConfig } from "../config";
+import { createDb, closeDb } from "../db";
 import { createLoreStore } from "./store";
 
-const DB_PATH = join(import.meta.dir, "..", "..", "data", "plana.db");
 const LORE_DIR = join(import.meta.dir, "..", "..", "docs", "lore");
 
 if (!existsSync(LORE_DIR)) {
@@ -10,18 +11,21 @@ if (!existsSync(LORE_DIR)) {
   process.exit(1);
 }
 
-const store = createLoreStore(DB_PATH);
-store.clear();
+const appConfig = loadConfig();
+const db = createDb(appConfig.databaseUrl!);
+const store = createLoreStore(db);
+
+await store.clear();
 
 const files = readdirSync(LORE_DIR).filter((f) => f.endsWith(".md"));
 let inserted = 0;
 
 for (const file of files) {
   const raw = readFileSync(join(LORE_DIR, file), "utf-8");
-  const { meta, sections } = parseLoreMarkdown(raw);
+  const { meta, sections } = parseLoreMarkdown(raw, file);
 
   for (const s of sections) {
-    store.insert({
+    await store.insert({
       characterName: meta.character ?? file.replace(".md", ""),
       category: s.category ?? meta.category ?? "general",
       title: s.title,
@@ -32,14 +36,11 @@ for (const file of files) {
   }
 }
 
-store.rebuild();
-store.close();
+await closeDb();
 
 console.log(`Seeded ${inserted} lore entries from ${files.length} file(s).`);
 
-// ── Parser ──────────────────────────────────────────────
-
-function parseLoreMarkdown(raw: string): {
+function parseLoreMarkdown(raw: string, fileName: string): {
   meta: Record<string, string>;
   sections: Array<{ category?: string; title: string; content: string }>;
 } {
@@ -68,10 +69,9 @@ function parseLoreMarkdown(raw: string): {
     }
   }
 
-  // If no ## sections found, use the whole body as one entry
   if (sections.length === 0 && body.trim()) {
     sections.push({
-      title: meta.title ?? file.replace(".md", ""),
+      title: meta.title ?? fileName.replace(".md", ""),
       content: body.trim(),
     });
   }

@@ -2,11 +2,19 @@ import type { ReminderStore } from "../reminders/store";
 import type { TaskStore } from "../tasks/store";
 import type { TaskStatus } from "../tasks/store";
 import type { MemoryStore } from "../memory/store";
-import type { MemoryTier } from "../memory/store";
 import type { LoreStore } from "../lore/store";
 import { searchAll, rerankWithLlm } from "../memory/search";
 import { parseWhen, parseRecurrence, formatDueAt } from "../reminders/parser";
 import type { ToolContext } from "./registry";
+import {
+  taskCreateSchema,
+  taskUpdateSchema,
+  taskStatusSchema,
+  taskPrioritySchema,
+  memoryTierSchema,
+  factInsertSchema,
+  parseOrError,
+} from "../database/validation";
 
 export function createReminderTools(store: ReminderStore) {
   function create(ctx: ToolContext, args: Record<string, unknown>): string {
@@ -16,6 +24,7 @@ export function createReminderTools(store: ReminderStore) {
 
     if (!message?.trim()) return "Error: message is required.";
     if (!when?.trim()) return "Error: when is required.";
+    if (message.trim().length > 2000) return "Error: message max length is 2000.";
 
     let dueDate: Date;
     try {
@@ -39,15 +48,20 @@ export function createReminderTools(store: ReminderStore) {
       recurrence = recurrenceStr.trim().toLowerCase();
     }
 
-    const row = store.create({
-      guildId: ctx.guildId,
-      channelId: ctx.channelId,
-      userId: ctx.userId,
-      message: message.trim(),
-      type: recurrence ? "recurring" : "once",
-      dueAt,
-      recurrence,
-    });
+    let row;
+    try {
+      row = store.create({
+        guildId: ctx.guildId,
+        channelId: ctx.channelId,
+        userId: ctx.userId,
+        message: message.trim(),
+        type: recurrence ? "recurring" : "once",
+        dueAt,
+        recurrence,
+      });
+    } catch (e) {
+      return `Error: ${e instanceof Error ? e.message : "invalid reminder"}`;
+    }
 
     const formatted = formatDueAt(dueAt, ctx.defaultTimezone);
     const typeLabel = recurrence ? ` (${recurrence})` : "";
@@ -198,19 +212,26 @@ export function createTaskTools(store: TaskStore) {
   }
 
   function add(ctx: ToolContext, args: Record<string, unknown>): string {
-    const title = (args.title as string)?.trim();
-    if (!title) return "Error: title is required.";
+    const parsed = parseOrError(
+      taskCreateSchema,
+      {
+        userId: ctx.userId,
+        title: typeof args.title === "string" ? args.title.trim() : args.title,
+        priority: args.priority,
+        category: args.category,
+        notes: args.notes,
+        deadline: args.deadline,
+      },
+      "add_task",
+    );
+    if (!parsed.ok) return `Error: ${parsed.error}`;
 
-    const row = store.create({
-      userId: ctx.userId,
-      title,
-      priority: (args.priority as string) ?? undefined,
-      category: (args.category as string) ?? undefined,
-      notes: (args.notes as string) ?? undefined,
-      deadline: (args.deadline as string) ?? undefined,
-    });
-
-    return `Task added:\n${formatTask(row)}`;
+    try {
+      const row = store.create(parsed.data);
+      return `Task added:\n${formatTask(row)}`;
+    } catch (e) {
+      return `Error: ${e instanceof Error ? e.message : "could not create task"}`;
+    }
   }
 
   function list(ctx: ToolContext, args: Record<string, unknown>): string {
@@ -241,13 +262,11 @@ export function createTaskTools(store: TaskStore) {
 
   function move(ctx: ToolContext, args: Record<string, unknown>): string {
     const id = args.task_id as number;
-    const status = args.status as string;
     if (!id) return "Error: task_id is required.";
-    if (!status) return "Error: status is required.";
 
-    const valid = ["backlog", "ready", "in-progress", "done"];
-    if (!valid.includes(status)) {
-      return `Error: invalid status "${status}". Use: ${valid.join(", ")}`;
+    const statusParsed = parseOrError(taskStatusSchema, args.status, "move_task");
+    if (!statusParsed.ok) {
+      return `Error: invalid status. Use: backlog, ready, in-progress, done`;
     }
 
     const task = store.getById(id);
@@ -256,8 +275,8 @@ export function createTaskTools(store: TaskStore) {
     }
 
     const oldStatus = task.status;
-    store.move(id, status as TaskStatus);
-    return `"${task.title}" moved from ${oldStatus} → ${status}.`;
+    store.move(id, statusParsed.data as TaskStatus);
+    return `"${task.title}" moved from ${oldStatus} → ${statusParsed.data}.`;
   }
 
   function edit(ctx: ToolContext, args: Record<string, unknown>): string {
@@ -269,18 +288,26 @@ export function createTaskTools(store: TaskStore) {
       return `Error: task #${id} not found.`;
     }
 
-    const fields: Record<string, string> = {};
-    if (args.title !== undefined) fields.title = args.title as string;
-    if (args.priority !== undefined) fields.priority = args.priority as string;
-    if (args.category !== undefined) fields.category = args.category as string;
-    if (args.notes !== undefined) fields.notes = args.notes as string;
-    if (args.deadline !== undefined) fields.deadline = args.deadline as string;
+    const fields: Record<string, unknown> = {};
+    if (args.title !== undefined) fields.title = args.title;
+    if (args.priority !== undefined) fields.priority = args.priority;
+    if (args.category !== undefined) fields.category = args.category;
+    if (args.notes !== undefined) fields.notes = args.notes;
+    if (args.deadline !== undefined) fields.deadline = args.deadline;
 
     if (Object.keys(fields).length === 0) {
       return "Error: at least one field to update is required.";
     }
 
-    const success = store.update(id, fields);
+    if (fields.priority !== undefined) {
+      const p = parseOrError(taskPrioritySchema, fields.priority, "edit_task.priority");
+      if (!p.ok) return `Error: ${p.error}`;
+    }
+
+    const parsed = parseOrError(taskUpdateSchema, fields, "edit_task");
+    if (!parsed.ok) return `Error: ${parsed.error}`;
+
+    const success = store.update(id, parsed.data);
     if (!success) return `Error: could not update task #${id}.`;
 
     const updated = store.getById(id)!;
@@ -396,7 +423,7 @@ export function createMemoryTools(
     const query = args.query as string;
     if (!query?.trim()) return "Error: query is required.";
 
-    const { memories, facts, lore } = searchAll(
+    const { memories, facts, lore } = await searchAll(
       memStore,
       loreStore,
       query.trim(),
@@ -447,35 +474,48 @@ export function createMemoryTools(
     return reranked || "No relevant results found.";
   }
 
-  function addFact(_ctx: ToolContext, args: Record<string, unknown>): string {
-    const fact = args.fact as string;
-    if (!fact?.trim()) return "Error: fact is required.";
+  async function addFact(_ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
+    const parsed = parseOrError(
+      factInsertSchema,
+      {
+        fact: typeof args.fact === "string" ? args.fact.trim() : args.fact,
+        source: "explicit",
+        confidence: 0.9,
+        nature: "persistent",
+      },
+      "add_fact",
+    );
+    if (!parsed.ok) return `Error: ${parsed.error}`;
 
-    memStore.insertFact(fact.trim(), {
-      source: "explicit",
-      confidence: 0.9,
-      nature: "persistent",
-    });
-    return `Fact recorded: "${fact.trim()}"`;
+    try {
+      await memStore.insertFact(parsed.data.fact, {
+        source: "explicit",
+        confidence: 0.9,
+        nature: "persistent",
+      });
+      return `Fact recorded: "${parsed.data.fact}"`;
+    } catch (e) {
+      return `Error: ${e instanceof Error ? e.message : "could not insert fact"}`;
+    }
   }
 
-  function saveMemory(_ctx: ToolContext, args: Record<string, unknown>): string {
+  async function saveMemory(_ctx: ToolContext, args: Record<string, unknown>): Promise<string> {
     const memory = (args.memory as string)?.trim();
     if (!memory) return "Error: memory is required.";
 
-    const tier = (args.tier as string)?.trim() || "daily";
-    const validTiers: MemoryTier[] = ["daily", "weekly", "monthly", "lifetime"];
-    const resolvedTier = validTiers.includes(tier as MemoryTier)
-      ? (tier as MemoryTier)
-      : "daily";
+    const tierRaw = (args.tier as string)?.trim() || "daily";
+    const tierParsed = parseOrError(memoryTierSchema, tierRaw, "save_memory.tier");
+    const resolvedTier = tierParsed.ok ? tierParsed.data : "daily";
 
-    const existing = memStore.getMemory(resolvedTier);
-    const newContent = existing
-      ? `${existing}\n${memory}`
-      : memory;
+    const existing = await memStore.getMemory(resolvedTier);
+    const newContent = existing ? `${existing}\n${memory}` : memory;
 
-    memStore.upsertMemory(resolvedTier, newContent);
-    return `Saved to [${resolvedTier}] memory: "${memory}"`;
+    try {
+      await memStore.upsertMemory(resolvedTier, newContent);
+      return `Saved to [${resolvedTier}] memory: "${memory}"`;
+    } catch (e) {
+      return `Error: ${e instanceof Error ? e.message : "could not save memory"}`;
+    }
   }
 
   return { recallKnowledge, addFact, saveMemory };

@@ -15,7 +15,7 @@ export function loadPersona(dirPath: string): PersonaDefinition {
   }
 
   currentPersona = loadPersonaDir(normalized);
-  console.log(`Loaded persona: ${JSON.stringify(currentPersona,null,2)}`);
+  console.log(`Persona loaded: ${currentPersona.meta.display_name} v${currentPersona.meta.version}`);
   return currentPersona;
 }
 

@@ -131,6 +131,10 @@ function shortConvo(guildId: string, channelId: string): string {
 
 function formatData(data: unknown): string {
   if (typeof data === "string") return data;
+  if (data instanceof Error) {
+    const cause = data.cause ? `\n  cause: ${String(data.cause)}` : "";
+    return `${data.name}: ${data.message}${cause}`;
+  }
   try {
     return JSON.stringify(data, null, 2);
   } catch {

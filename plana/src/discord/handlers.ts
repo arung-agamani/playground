@@ -76,9 +76,9 @@ export function createHandlers(deps: HandlerDeps) {
       );
       const hasImages = imageAttachments.size > 0;
 
-      const memoryBlock = memoryStore.buildMemoryBlock();
+      const memoryBlock = await memoryStore.buildMemoryBlock();
 
-      let currentMessages = convManager.buildApiMessages(
+      let currentMessages = await convManager.buildApiMessages(
         guildId,
         channelId,
         systemPrompt,
@@ -106,7 +106,7 @@ export function createHandlers(deps: HandlerDeps) {
 
       const activeModel = hasImages ? appConfig.visionModel : appConfig.defaultModel;
 
-      store.saveMessage(guildId, channelId, "user", message.content);
+      await store.saveMessage(guildId, channelId, "user", message.content);
       incrementCount(thresholdState);
 
       const allToolNames: string[] = [];
@@ -192,7 +192,7 @@ export function createHandlers(deps: HandlerDeps) {
             allResultLines.push(toolResult);
           }
 
-          store.saveMessage(
+          await store.saveMessage(
             guildId,
             channelId,
             "assistant",
@@ -201,7 +201,7 @@ export function createHandlers(deps: HandlerDeps) {
           );
 
           for (const tr of roundToolResults) {
-            store.saveMessage(guildId, channelId, "tool", tr.content as string, null, tr.tool_call_id);
+            await store.saveMessage(guildId, channelId, "tool", tr.content as string, null, tr.tool_call_id);
           }
 
           currentMessages = [
@@ -223,7 +223,7 @@ export function createHandlers(deps: HandlerDeps) {
           }
 
           log.llmResponse("stop", text);
-          store.saveMessage(guildId, channelId, "assistant", text);
+          await store.saveMessage(guildId, channelId, "assistant", text);
           log.responseSent(channelId, text);
 
           if (statusMsg) {
@@ -259,7 +259,7 @@ export function createHandlers(deps: HandlerDeps) {
           }
 
           log.llmResponse("stop", text);
-          store.saveMessage(guildId, channelId, "assistant", text);
+          await store.saveMessage(guildId, channelId, "assistant", text);
           log.responseSent(channelId, text);
 
           if (statusMsg) {
@@ -281,8 +281,8 @@ export function createHandlers(deps: HandlerDeps) {
     }
   }
 
-  function clearConversation(guildId: string, channelId: string): void {
-    store.clearConversation(guildId, channelId);
+  async function clearConversation(guildId: string, channelId: string): Promise<void> {
+    await store.clearConversation(guildId, channelId);
     log.info(`Conversation cleared: ${guildId}:${channelId}`);
   }
 
@@ -347,10 +347,10 @@ export function createHandlers(deps: HandlerDeps) {
     }
   }
 
-  function showMemory(): string {
-    const block = memoryStore.buildMemoryBlock();
+  async function showMemory(): Promise<string> {
+    const block = await memoryStore.buildMemoryBlock();
     if (!block) return "I do not have any memories stored yet, Sensei.";
-    const facts = memoryStore.getAllFacts();
+    const facts = await memoryStore.getAllFacts();
     const factsText = facts.length > 0
       ? `\n\nKnown facts (${facts.length}):\n${facts.map((f) => `- ${f.fact} (${f.confidence.toFixed(1)})`).join("\n")}`
       : "";
